@@ -1,0 +1,4 @@
+mfrc522
+easyocr
+ultralytics
+picamera2

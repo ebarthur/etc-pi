@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Models & captured data (large/binary)
+anpr/models/*.pt
+anpr/captures/*
+
+# Local DB
+db/*.db
+
+# Logs
+logs/*
+
+# Wrangler / Node
+workers/**/.wrangler/
+workers/**/node_modules/
+workers/dashboard/build/
+
+# Env/secrets
+.env
+*.local
+
+# OS
+.DS_Store
