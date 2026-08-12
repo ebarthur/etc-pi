@@ -11,6 +11,10 @@ anpr/captures/*
 # Local DB
 db/*.db
 
+# Dead directory — filesystem corruption made it unreadable/undeletable (needs e2fsck to
+# reclaim). Mock data now lives in api_clients/fixtures/ instead.
+api_clients/mock_data/
+
 # Logs
 logs/*
 
@@ -22,6 +26,5 @@ workers/dashboard/build/
 # Env/secrets
 .env
 *.local
-
 # OS
 .DS_Store

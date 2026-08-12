@@ -1,0 +1,17 @@
+{
+  "A1B2C3D4": {
+    "ghana_card_id": "GHA-000000001-1",
+    "name": "Kwame Mensah",
+    "phone_number": "0244000001"
+  },
+  "B2C3D4E5": {
+    "ghana_card_id": "GHA-000000002-2",
+    "name": "Ama Owusu",
+    "phone_number": "0244000002"
+  },
+  "C3D4E5F6": {
+    "ghana_card_id": "GHA-000000003-3",
+    "name": "Kofi Boateng",
+    "phone_number": "0244000003"
+  }
+}
