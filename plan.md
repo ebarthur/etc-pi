@@ -87,11 +87,22 @@ commands to hand-verify Phase 0/1 individually whenever you get to it, from the 
          RFID-timeout paths log correctly. All smoke-test DB rows were then wiped
          (`db/tolling.db` is local/gitignored scratch data, not meant to persist).
 
-## Phase 2 — Tests
+## Phase 2 — Tests — DONE
 
-- [ ] Fill in `tests/test_rfid.py` — mock `MFRC522`, test timeout behavior and UID formatting.
-- [ ] Fill in `tests/test_integration.py` — end-to-end against a throwaway SQLite file (not the
-      real `db/tolling.db`), mocking Paystack's HTTP call.
+- [x] Filled in `tests/test_rfid.py` — mocks `MFRC522` (via `tests/conftest.py` stubbing
+      `RPi.GPIO`/`mfrc522` in `sys.modules`, since neither is installed on this dev machine);
+      covers a successful scan, a timeout, BCC-checksum-byte stripping in `_format_uid`, and
+      GPIO cleanup.
+- [x] Filled in `tests/test_integration.py` — end-to-end against a throwaway SQLite file
+      (`tmp_path`, not `db/tolling.db`) via `handle_uid()`, with Paystack's and Arkesel's HTTP
+      calls mocked (both route through the same `requests` module object, so it's one patch
+      keyed by URL, not two — a second separate patch would silently clobber the first).
+      Covers: known-UID success, unknown UID (audit log only, no transaction row), pending
+      charge (left `PENDING` for the Phase 3 webhook), and failed charge.
+- [x] Added `requirements-dev.txt` (`-r requirements.txt` + `pytest==9.1.1`, verified live)
+      since pytest is a dev-only dependency, not something the Pi needs at runtime.
+- [x] Ran the suite locally: `python3 -m pytest tests/test_rfid.py tests/test_integration.py -v`
+      — 9 passed.
 
 ## Phase 3 — Paystack webhook (`workers/charge`)
 
