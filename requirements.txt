@@ -1,6 +1,11 @@
 mfrc522==0.0.7
 RPi.GPIO==0.7.1
-easyocr==1.7.2
+# No OCR library here on purpose: both the plate detector and the OCR step will run from
+# custom-trained .pt models (not a generic pretrained OCR engine like easyocr), decided
+# 2026-08-15 — see plan.md Phase 5. ultralytics covers the YOLO detector; if the OCR model
+# turns out to also be a YOLO-format model, ultralytics covers that too with no new
+# dependency. Add torch/torchvision explicitly if the OCR model turns out to be a
+# non-YOLO custom architecture loaded via a raw torch.load() instead.
 ultralytics==8.4.118
 # picamera2 is best installed via apt on Raspberry Pi OS (`python3-picamera2`) since it
 # binds against the system libcamera install — the pip version is a fallback for venvs

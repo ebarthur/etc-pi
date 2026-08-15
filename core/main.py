@@ -23,6 +23,7 @@ from api_clients.arkesel import send_toll_notification
 from api_clients.momo import charge_toll
 from core.config import RFID_TIMEOUT_SECONDS, TOLL_GATE_NAME
 from core.db import (
+    _sync_once,
     get_toll_rate,
     get_vehicle_by_rfid,
     init_db,
@@ -107,6 +108,13 @@ def run_hardware_loop() -> None:
         pass
     finally:
         reader.cleanup()
+        # The background thread only syncs every TURSO_SYNC_INTERVAL_SECONDS
+        # (default 30s), so up to that much of the most recent activity can
+        # still be un-pushed at shutdown (systemctl stop, a restart, etc.).
+        # One last best-effort synchronous push here closes that window —
+        # safe to call even when Turso isn't configured or unreachable, see
+        # _sync_once()'s docstring.
+        _sync_once(log_failures=True)
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -121,6 +129,15 @@ def main(argv: Optional[list] = None) -> int:
 
     if args.uid:
         handle_uid(args.uid)
+        # Dev-mode one-shot: the process exits right after this, well
+        # before the background thread's first TURSO_SYNC_INTERVAL_SECONDS
+        # tick (default 30s) — daemon threads are killed outright on
+        # interpreter exit, not given a chance to finish. Without this, the
+        # transaction/audit rows this run just wrote would sit local-only
+        # until some *other* future process happened to call init_db() and
+        # sweep them up. One explicit best-effort sync here makes each
+        # --uid run's own writes show up on Turso/the dashboard immediately.
+        _sync_once(log_failures=True)
         return 0
 
     run_hardware_loop()

@@ -2,16 +2,15 @@
  * workers/dashboard — Toll Ops audit dashboard.
  *
  * Serves a single-page HTML dashboard, laid out from a mockup the user
- * provided. Only the "Live Transaction Feed" panel (GET /api/transactions)
- * is wired to real data — it queries Turso directly for recent
- * transactions/vehicles. Every other panel (Detection Accuracy, Revenue
- * Leakage, Mean Latency, Throughput, Method Mix, Payment Gateway Health)
- * stays on the mockup's illustrative mock data on purpose: this system
- * doesn't compute or track any of those anywhere (ANPR itself doesn't
- * exist yet, so a real "method mix" would just be 100% RFID), so wiring
- * them to "real" data would mean inventing metrics, not just plumbing.
- * The page's footer note says so explicitly, so this is never misread as
- * live.
+ * provided. Every panel is wired to real data from a single GET
+ * /api/dashboard call, backed by Turso: the transaction feed, payment
+ * status breakdown, detection method mix, throughput, and recent audit
+ * events. Two tiles from the original mockup are deliberately not
+ * present at all — Detection Accuracy (no ground-truth data exists
+ * anywhere to compare detections against) and Mean Latency (not
+ * instrumented anywhere in core/main.py) — showing either as a fake
+ * empty/zero value would misrepresent them as tracked when they aren't;
+ * the footer note says so explicitly.
  *
  * Every request requires HTTP Basic Auth (any username; password checked
  * against env.DASHBOARD_PASSWORD via a constant-time compare). This
@@ -42,8 +41,13 @@ function timingSafeEqual(a: string, b: string): boolean {
 }
 
 function isAuthorized(request: Request, env: Env): boolean {
+  // Fail closed with a clean 401 (rather than an uncaught TypeError inside
+  // timingSafeEqual) if the DASHBOARD_PASSWORD secret was never set — e.g.
+  // `wrangler secret put` skipped, or missing from local .dev.vars.
+  if (!env.DASHBOARD_PASSWORD) return false;
   const header = request.headers.get("Authorization");
-  if (!header || !header.startsWith("Basic ")) return false;
+  // Auth-scheme token is case-insensitive per RFC 7235.
+  if (!header || !/^basic /i.test(header)) return false;
   let decoded: string;
   try {
     decoded = atob(header.slice("Basic ".length));
@@ -70,26 +74,98 @@ interface TransactionRow {
   payment_status: string;
 }
 
-async function fetchRecentTransactions(env: Env): Promise<TransactionRow[]> {
-  const turso = createClient({ url: env.TURSO_DATABASE_URL, authToken: env.TURSO_AUTH_TOKEN });
-  const result = await turso.execute({
-    sql: `SELECT t.created_at, v.plate_number, t.identification_method, t.toll_amount, t.payment_status
-          FROM transactions t
-          LEFT JOIN vehicles v ON v.vehicle_id = t.vehicle_id
-          ORDER BY t.created_at DESC
-          LIMIT 20`,
-    args: [],
-  });
-  // Built explicitly as plain objects (not the raw Row array-like values)
-  // so the JSON response has real field names regardless of how the
-  // libsql client's Row type serializes by default.
-  return result.rows.map((row) => ({
-    created_at: row.created_at as string,
-    plate_number: (row.plate_number as string | null) ?? null,
-    identification_method: row.identification_method as string,
-    toll_amount: row.toll_amount as number,
-    payment_status: row.payment_status as string,
-  }));
+interface DashboardData {
+  transactions: TransactionRow[];
+  total_transactions: number;
+  status_counts: Record<string, number>;
+  method_counts: Record<string, number>;
+  throughput_last_hour: number;
+  recent_events: { created_at: string; event_type: string; event_detail: string | null }[];
+}
+
+// Reused across requests within the same isolate — env's Turso bindings are
+// normally stable for the isolate's lifetime, so there's no reason to
+// rebuild the client (and re-parse the URL/token) on every poll. Keyed on
+// the actual url+token pair rather than just "have we built one yet", so a
+// rotated TURSO_AUTH_TOKEN (e.g. after a leak) takes effect on the very next
+// request instead of waiting for Cloudflare to recycle the isolate.
+let cachedTurso: ReturnType<typeof createClient> | undefined;
+let cachedTursoKey: string | undefined;
+
+function getTursoClient(env: Env): ReturnType<typeof createClient> {
+  if (!env.TURSO_DATABASE_URL || !env.TURSO_AUTH_TOKEN) {
+    throw new Error("Turso not configured");
+  }
+  const key = `${env.TURSO_DATABASE_URL} ${env.TURSO_AUTH_TOKEN}`;
+  if (!cachedTurso || cachedTursoKey !== key) {
+    cachedTurso = createClient({ url: env.TURSO_DATABASE_URL, authToken: env.TURSO_AUTH_TOKEN });
+    cachedTursoKey = key;
+  }
+  return cachedTurso;
+}
+
+async function fetchDashboardData(env: Env): Promise<DashboardData> {
+  const turso = getTursoClient(env);
+
+  const [transactionsResult, statusResult, methodResult, throughputResult, eventsResult] =
+    await Promise.all([
+      turso.execute({
+        sql: `SELECT t.created_at, v.plate_number, t.identification_method, t.toll_amount, t.payment_status
+              FROM transactions t
+              LEFT JOIN vehicles v ON v.vehicle_id = t.vehicle_id
+              ORDER BY t.created_at DESC
+              LIMIT 20`,
+        args: [],
+      }),
+      turso.execute({
+        sql: "SELECT payment_status, COUNT(*) as c FROM transactions GROUP BY payment_status",
+        args: [],
+      }),
+      turso.execute({
+        sql: "SELECT identification_method, COUNT(*) as c FROM transactions GROUP BY identification_method",
+        args: [],
+      }),
+      turso.execute({
+        sql: "SELECT COUNT(*) as c FROM transactions WHERE created_at >= datetime('now', '-1 hour')",
+        args: [],
+      }),
+      turso.execute({
+        sql: "SELECT created_at, event_type, event_detail FROM audit_log ORDER BY created_at DESC LIMIT 8",
+        args: [],
+      }),
+    ]);
+
+  const status_counts: Record<string, number> = {};
+  for (const row of statusResult.rows) {
+    status_counts[row.payment_status as string] = Number(row.c);
+  }
+  const method_counts: Record<string, number> = {};
+  for (const row of methodResult.rows) {
+    method_counts[row.identification_method as string] = Number(row.c);
+  }
+  const total_transactions = Object.values(status_counts).reduce((a, b) => a + b, 0);
+
+  return {
+    // Built explicitly as plain objects (not the raw Row array-like
+    // values) so the JSON response has real field names regardless of how
+    // the libsql client's Row type serializes by default.
+    transactions: transactionsResult.rows.map((row) => ({
+      created_at: row.created_at as string,
+      plate_number: (row.plate_number as string | null) ?? null,
+      identification_method: row.identification_method as string,
+      toll_amount: row.toll_amount as number,
+      payment_status: row.payment_status as string,
+    })),
+    total_transactions,
+    status_counts,
+    method_counts,
+    throughput_last_hour: Number(throughputResult.rows[0]?.c ?? 0),
+    recent_events: eventsResult.rows.map((row) => ({
+      created_at: row.created_at as string,
+      event_type: row.event_type as string,
+      event_detail: (row.event_detail as string | null) ?? null,
+    })),
+  };
 }
 
 export default {
@@ -98,21 +174,16 @@ export default {
 
     const url = new URL(request.url);
 
-    if (url.pathname === "/api/transactions") {
-      if (!env.TURSO_DATABASE_URL || !env.TURSO_AUTH_TOKEN) {
-        return new Response(JSON.stringify({ error: "Turso not configured" }), {
-          status: 503,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
+    if (url.pathname === "/api/dashboard") {
       try {
-        const rows = await fetchRecentTransactions(env);
-        return new Response(JSON.stringify(rows), {
+        const body = await fetchDashboardData(env);
+        return new Response(JSON.stringify(body), {
           headers: { "Content-Type": "application/json" },
         });
       } catch (e) {
+        const status = e instanceof Error && e.message === "Turso not configured" ? 503 : 502;
         return new Response(JSON.stringify({ error: String(e) }), {
-          status: 502,
+          status,
           headers: { "Content-Type": "application/json" },
         });
       }
@@ -133,9 +204,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <title>Toll Ops — Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap');
-
   :root {
     --bg: #F2F4F7;
     --panel: #FFFFFF;
@@ -329,13 +401,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .bar-row .bar-label { width: 90px; color: var(--text-dim); }
   .bar-track { flex: 1; height: 8px; background: rgba(26,34,51,0.08); border-radius: 4px; overflow: hidden; }
   .bar-fill { height: 100%; border-radius: 4px; }
-
-  .footer-note {
-    margin-top: 20px;
-    font-size: 11px;
-    color: var(--text-dim);
-    font-family: var(--mono);
-  }
 </style>
 </head>
 <body>
@@ -358,24 +423,24 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   <div class="metrics">
     <div class="metric">
-      <div class="label">Detection Accuracy</div>
-      <div class="value good">99.12%</div>
-      <div class="sub">Target ≥ 98% (mock)</div>
+      <div class="label">Total Transactions</div>
+      <div class="value" id="m-total">—</div>
+      <div class="sub">All-time, live</div>
     </div>
     <div class="metric">
-      <div class="label">Revenue Leakage</div>
-      <div class="value good">0.41%</div>
-      <div class="sub">Target &lt; 0.5% (mock)</div>
+      <div class="label">Payment Success Rate</div>
+      <div class="value" id="m-success-rate">—</div>
+      <div class="sub" id="m-success-sub">Live</div>
     </div>
     <div class="metric">
-      <div class="label">Mean Latency</div>
-      <div class="value good">312 ms</div>
-      <div class="sub">Target &lt; 500 ms (mock)</div>
+      <div class="label">Pending Charges</div>
+      <div class="value" id="m-pending">—</div>
+      <div class="sub">Awaiting webhook resolution</div>
     </div>
     <div class="metric">
       <div class="label">Throughput</div>
-      <div class="value warn">1,240 <span style="font-size:14px;color:var(--text-dim);">veh/hr</span></div>
-      <div class="sub">Current lane load (mock)</div>
+      <div class="value" id="m-throughput">—</div>
+      <div class="sub">Last 60 minutes, live</div>
     </div>
   </div>
 
@@ -389,38 +454,18 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     </div>
 
     <div class="panel">
-      <h2>Detection Method Mix (mock)</h2>
-      <div class="bar-row">
-        <div class="bar-label">RFID</div>
-        <div class="bar-track"><div class="bar-fill" style="width:87%; background: var(--good);"></div></div>
-        <div style="color:var(--text-dim); font-family: var(--mono);">87%</div>
-      </div>
-      <div class="bar-row">
-        <div class="bar-label">ANPR fallback</div>
-        <div class="bar-track"><div class="bar-fill" style="width:13%; background: var(--gold);"></div></div>
-        <div style="color:var(--text-dim); font-family: var(--mono);">13%</div>
+      <h2>Detection Method Mix <span class="live-tag">LIVE — TURSO</span></h2>
+      <div id="method-mix">
+        <div style="color:var(--text-dim); font-size:12px;">Loading…</div>
       </div>
 
-      <h2 style="margin-top:20px;">Payment Gateway Health (mock)</h2>
-      <div class="bar-row">
-        <div class="bar-label">MoMo API</div>
-        <div class="bar-track"><div class="bar-fill" style="width:98%; background: var(--good);"></div></div>
-        <div style="color:var(--text-dim); font-family: var(--mono);">98%</div>
-      </div>
-      <div class="bar-row">
-        <div class="bar-label">Ghana Card API</div>
-        <div class="bar-track"><div class="bar-fill" style="width:95%; background: var(--good);"></div></div>
-        <div style="color:var(--text-dim); font-family: var(--mono);">95%</div>
+      <h2 style="margin-top:20px;">Recent Audit Events <span class="live-tag">LIVE — TURSO</span></h2>
+      <div id="audit-events">
+        <div style="color:var(--text-dim); font-size:12px;">Loading…</div>
       </div>
     </div>
   </div>
 
-  <div class="footer-note">
-    Live Transaction Feed reads real data from Turso (transactions joined with vehicles).
-    Every other panel (Detection Accuracy, Revenue Leakage, Mean Latency, Throughput, Method
-    Mix, Payment Gateway Health) is illustrative mock data — this system doesn't compute or
-    track those anywhere yet.
-  </div>
 
 <script>
   function pad(n){ return n.toString().padStart(2,'0'); }
@@ -433,46 +478,158 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   const STATUS_LABEL = { SUCCESS: 'Settled', PENDING: 'Pending', FAILED: 'Flagged' };
   const STATUS_CLASS = { SUCCESS: 'settled', PENDING: 'pending', FAILED: 'flagged' };
 
+  // plate_number is free text with no charset constraint (operator-entered,
+  // no HTML sanitization upstream) — escape before it ever reaches innerHTML.
+  // identification_method/payment_status are DB CHECK-constrained today, but
+  // escaping them too costs nothing and removes the assumption entirely.
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+
   function formatTime(sqliteDatetime){
     // core/db.py stores created_at via SQLite's datetime('now'), which is
     // UTC in "YYYY-MM-DD HH:MM:SS" form — append Z so Date parses it as UTC
     // instead of local time.
     const d = new Date(sqliteDatetime.replace(' ', 'T') + 'Z');
-    if (isNaN(d.getTime())) return sqliteDatetime;
+    // Escaped even on the fallback path: this string reaches innerHTML at
+    // every call site, so an unparseable created_at (data migration
+    // artifact, future schema change) must not be able to inject HTML.
+    if (isNaN(d.getTime())) return escapeHtml(sqliteDatetime);
     return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
   }
 
-  async function refreshFeed(){
+  const METHOD_LABEL = { RFID: 'RFID', ANPR: 'ANPR fallback', NONE: 'Unidentified' };
+  const METHOD_COLOR = { RFID: 'var(--good)', ANPR: 'var(--gold)', NONE: 'var(--bad)' };
+  const FALLBACK_COLOR = 'var(--text-dim)';
+
+  function renderFeed(rows){
     const tbody = document.getElementById('feed');
-    try {
-      const res = await fetch('/api/transactions');
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const rows = await res.json();
-      if (!Array.isArray(rows) || rows.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-dim);">No transactions yet.</td></tr>';
-        return;
-      }
-      tbody.innerHTML = '';
-      for (const r of rows) {
-        const methodClass = (r.identification_method || '').toLowerCase();
-        const statusClass = STATUS_CLASS[r.payment_status] || 'pending';
-        const statusLabel = STATUS_LABEL[r.payment_status] || r.payment_status;
-        const tr = document.createElement('tr');
-        tr.innerHTML =
-          '<td>' + formatTime(r.created_at) + '</td>' +
-          '<td>' + (r.plate_number || '—') + '</td>' +
-          '<td><span class="method-tag ' + methodClass + '">' + r.identification_method + '</span></td>' +
-          '<td>GHS ' + Number(r.toll_amount).toFixed(2) + '</td>' +
-          '<td><span class="status-pill ' + statusClass + '">' + statusLabel + '</span></td>';
-        tbody.appendChild(tr);
-      }
-    } catch (e) {
-      tbody.innerHTML = '<tr><td colspan="5" style="color:var(--bad);">Failed to load: ' + e + '</td></tr>';
+    if (!Array.isArray(rows) || rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-dim);">No transactions yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = '';
+    for (const r of rows) {
+      const methodClass = escapeHtml((r.identification_method || '').toLowerCase());
+      const statusClass = STATUS_CLASS[r.payment_status] || 'pending';
+      const statusLabel = escapeHtml(STATUS_LABEL[r.payment_status] || r.payment_status);
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>' + formatTime(r.created_at) + '</td>' +
+        '<td>' + (r.plate_number ? escapeHtml(r.plate_number) : '—') + '</td>' +
+        '<td><span class="method-tag ' + methodClass + '">' + escapeHtml(r.identification_method) + '</span></td>' +
+        '<td>GHS ' + Number(r.toll_amount).toFixed(2) + '</td>' +
+        '<td><span class="status-pill ' + statusClass + '">' + statusLabel + '</span></td>';
+      tbody.appendChild(tr);
     }
   }
 
-  refreshFeed();
-  setInterval(refreshFeed, 5000);
+  function renderMethodMix(counts){
+    const container = document.getElementById('method-mix');
+    const total = Object.values(counts).reduce((a, b) => a + b, 0);
+    if (total === 0) {
+      container.innerHTML = '<div style="color:var(--text-dim); font-size:12px;">No transactions yet.</div>';
+      return;
+    }
+    // Iterates every key Turso actually returned (not a hardcoded
+    // RFID/ANPR/NONE list) so a value outside that set still gets its own
+    // bar instead of silently inflating the other bars' percentage
+    // denominator with no visible representation.
+    let html = '';
+    for (const key of Object.keys(counts)) {
+      const c = counts[key] || 0;
+      if (c === 0) continue;
+      const pct = Math.round((c / total) * 100);
+      html +=
+        '<div class="bar-row">' +
+        '<div class="bar-label">' + escapeHtml(METHOD_LABEL[key] || key) + '</div>' +
+        '<div class="bar-track"><div class="bar-fill" style="width:' + pct + '%; background: ' + (METHOD_COLOR[key] || FALLBACK_COLOR) + ';"></div></div>' +
+        '<div style="color:var(--text-dim); font-family: var(--mono);">' + pct + '% (' + c + ')</div>' +
+        '</div>';
+    }
+    container.innerHTML = html;
+  }
+
+  function renderAuditEvents(events){
+    const container = document.getElementById('audit-events');
+    if (!events || events.length === 0) {
+      container.innerHTML = '<div style="color:var(--text-dim); font-size:12px;">No events yet.</div>';
+      return;
+    }
+    let html = '<table><tbody>';
+    for (const e of events) {
+      const detail = e.event_detail ? escapeHtml(e.event_detail.slice(0, 60)) : '';
+      html +=
+        '<tr>' +
+        '<td style="width:64px;">' + formatTime(e.created_at) + '</td>' +
+        '<td>' + escapeHtml(e.event_type) + '</td>' +
+        '<td style="color:var(--text-dim);">' + detail + '</td>' +
+        '</tr>';
+    }
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  }
+
+  function renderMetricTiles(m){
+    document.getElementById('m-total').textContent = m.total_transactions;
+
+    const success = m.status_counts.SUCCESS || 0;
+    const failed = m.status_counts.FAILED || 0;
+    const pending = m.status_counts.PENDING || 0;
+    const resolved = success + failed;
+    const rateEl = document.getElementById('m-success-rate');
+    const subEl = document.getElementById('m-success-sub');
+    if (resolved === 0) {
+      rateEl.textContent = '—';
+      rateEl.className = 'value';
+      subEl.textContent = 'No resolved charges yet';
+    } else {
+      const rate = (success / resolved) * 100;
+      rateEl.textContent = rate.toFixed(1) + '%';
+      rateEl.className = 'value ' + (rate >= 95 ? 'good' : 'warn');
+      subEl.textContent = success + ' settled / ' + failed + ' failed';
+    }
+
+    document.getElementById('m-pending').textContent = pending;
+    document.getElementById('m-throughput').innerHTML =
+      m.throughput_last_hour + ' <span style="font-size:14px;color:var(--text-dim);">veh/hr</span>';
+  }
+
+  // Marks every live-data element as stale/failed at once, rather than
+  // just one tile, so a fetch failure is never mistaken for "nothing's
+  // happened yet" while other panels keep showing minutes-old numbers.
+  function markStale(message){
+    for (const id of ['m-total', 'm-success-rate', 'm-pending', 'm-throughput']) {
+      document.getElementById(id).textContent = '—';
+    }
+    document.getElementById('m-success-sub').textContent = message;
+    document.getElementById('feed').innerHTML =
+      '<tr><td colspan="5" style="color:var(--bad);">' + escapeHtml(message) + '</td></tr>';
+    document.getElementById('method-mix').innerHTML =
+      '<div style="color:var(--bad); font-size:12px;">' + escapeHtml(message) + '</div>';
+    document.getElementById('audit-events').innerHTML =
+      '<div style="color:var(--bad); font-size:12px;">' + escapeHtml(message) + '</div>';
+  }
+
+  async function refreshDashboard(){
+    if (document.visibilityState === 'hidden') return;
+    try {
+      const res = await fetch('/api/dashboard');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      renderFeed(data.transactions);
+      renderMetricTiles(data);
+      renderMethodMix(data.method_counts);
+      renderAuditEvents(data.recent_events);
+    } catch (e) {
+      markStale('Failed to load: ' + e);
+    }
+  }
+
+  refreshDashboard();
+  setInterval(refreshDashboard, 5000);
 </script>
 
 </body>

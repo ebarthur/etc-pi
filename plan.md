@@ -194,8 +194,18 @@ not started. Everything else that's left needs something only you can provide �
 
 ## Phase 5 — ANPR (once models exist)
 
+**Scope decision, 2026-08-15**: both the plate detector *and* the OCR step will be
+custom-trained `.pt` models supplied by the user — not a generic pretrained OCR engine. The
+original assumption (YOLOv11 detector + `easyocr` for reading the cropped plate) is dropped;
+`easyocr` was removed from `requirements.txt`. `ultralytics` alone covers the detector, and
+covers the OCR model too if it also turns out to be YOLO-format — not yet confirmed. If the OCR
+model turns out to be a non-YOLO custom architecture instead, add `torch`/`torchvision`
+explicitly at that point (not before — avoids installing a second ML framework's weight until
+it's known to be needed).
+
 - [ ] `anpr/yolov11.py`: load the trained `.pt` (YOLOv11 plate detector) via `ultralytics`,
-      crop plate region, feed to the OCR model.
+      crop plate region, feed to the OCR model (loading mechanism TBD — see scope decision
+      above, pending which model format the OCR `.pt` turns out to be).
 - [ ] Wire into `core/main.py`'s existing fallback seam from Phase 1 — triggered when RFID
       read times out.
 - [ ] Confidence threshold below which we don't trust the plate match (config value, tune
@@ -345,14 +355,42 @@ prior testing (offline-only, against unreachable/bogus hosts) could have caught:
       coverage — lower priority now that the actual push mechanism is confirmed correct.
 
 **Cloudflare Worker** (`workers/charge` — Paystack webhook). Node/npm are now available on this
-dev machine (they weren't when this was first built) — typecheck is DONE:
+dev machine (they weren't when this was first built) — DEPLOYED 2026-08-15:
 - [x] `cd workers/charge && npm install && npm run typecheck` — passes clean, no errors.
-- [ ] `wrangler secret put PAYSTACK_SECRET_KEY` / `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN`,
-      then `wrangler deploy`.
-- [ ] Point Paystack's webhook URL (dashboard → Settings → API Keys & Webhooks) at the
-      deployed Worker URL, trigger a real mobile money test charge, confirm the transaction
-      resolves from `PENDING` to `SUCCESS`/`FAILED` and a `WEBHOOK_CHARGE_RESOLVED` audit_log
-      row appears.
+- [x] Secrets set (`PAYSTACK_SECRET_KEY`/`TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`) and
+      `wrangler deploy` run — live at `https://smart-toll-charge-webhook.steam67.workers.dev`.
+      **Real gotcha hit during this deploy**: `.env`'s values are double-quoted
+      (`KEY="value"`); Python's `python-dotenv` strips the quotes automatically, but a naive
+      shell `cut -d= -f2-` extraction (used to pipe values into `wrangler secret put` without
+      ever printing them) does not — the first deploy attempt set `TURSO_DATABASE_URL` to the
+      literal string `"libsql://...io"`, quote characters included, and every Turso query
+      failed with `URL_INVALID`. Fixed by stripping surrounding quotes before piping into
+      `wrangler secret put`; re-set all three secrets, confirmed clean afterward.
+- [x] Live sanity checks: `GET` → `405`; `POST` with no/bad signature → `401` (signature
+      verification confirmed working against the deployed instance, not just locally).
+- [ ] Point Paystack's webhook URL (dashboard → Settings → API Keys & Webhooks) at
+      `https://smart-toll-charge-webhook.steam67.workers.dev` — **your step, dashboard-only,
+      no public API for it**. Then trigger a real mobile money test charge, confirm the
+      transaction resolves from `PENDING` to `SUCCESS`/`FAILED` and a `WEBHOOK_CHARGE_RESOLVED`
+      audit_log row appears.
+
+**Cloudflare Worker** (`workers/dashboard` — ops dashboard) — DEPLOYED 2026-08-15:
+- [x] Secrets set (`DASHBOARD_PASSWORD`/`TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`, same
+      quote-stripping fix as above) and deployed — live at
+      `https://smart-toll-dashboard.steam67.workers.dev`.
+- [x] Live sanity checks: no auth → `401`; wrong password → `401`; correct password → `200`
+      and `/api/transactions` returns real (currently empty — no live transactions yet) JSON
+      from Turso, not an error.
+- [x] Code review pass on `workers/dashboard/src/index.ts` (the one file from this session that
+      hadn't gone through one yet) found and fixed a real **stored XSS**: `plate_number` (no DB
+      CHECK constraint, operator-suppliable via `scripts/register_vehicle.py --plate`) was
+      concatenated unescaped into the feed table's `innerHTML` on every 5s poll — a malicious
+      plate string would execute JS in every authenticated viewer's browser. Fixed with an
+      `escapeHtml()` helper applied to all DB-sourced fields rendered into the DOM. Also fixed:
+      a missing-secret crash (undefined `DASHBOARD_PASSWORD` threw instead of a clean `401`),
+      a case-sensitive Basic-auth scheme check (RFC 7235 allows lowercase `basic`), a new Turso
+      client being built on every single poll instead of reused, a render-blocking Google Fonts
+      `@import`, and unconditional polling when the browser tab isn't visible.
 
 ## Code review pass — 2026-08-15 — DONE
 
@@ -391,36 +429,99 @@ works):
       an unregistered tag, confirm the RFID-timeout path logs cleanly after ~2s; `sudo systemctl
       stop smart-toll`, confirm no GPIO cleanup error in the log.
 
-## Ops dashboard (`workers/dashboard`) — 2026-08-15 — started
+## Ops dashboard (`workers/dashboard`) — 2026-08-15 — DEPLOYED, fully live
 
 Wasn't part of the original phased plan (`workers/dashboard/` was just an empty `.gitkeep`
-placeholder from the initial skeleton) — started now from a layout mockup the user provided.
-Scaffolded as a Cloudflare Worker, same shape as `workers/charge`: `package.json`/`tsconfig.json`
-(identical dependency pins), `wrangler.toml`, `src/index.ts` — typechecks clean.
+placeholder from the initial skeleton) — started from a layout mockup the user provided,
+initially with only the transaction feed live and everything else mock (per an explicit choice
+at the time), then the user asked for every mock value removed. Live at
+`https://smart-toll-dashboard.steam67.workers.dev`.
 
 - [x] Gated behind HTTP Basic Auth (`DASHBOARD_PASSWORD` secret, constant-time compared) on
-      every request, decided deliberately before wiring any real data: unlike `workers/charge`
-      (only ever receives Paystack's own signed webhook calls), this Worker serves real customer
-      data — phone numbers via `vehicles`, plate numbers — to whoever can reach the URL, so it
-      must never be servable without a shared secret.
-- [x] **Live Transaction Feed** panel wired to real data: `GET /api/transactions` queries Turso
-      (`transactions` LEFT JOIN `vehicles` on `vehicle_id`, ordered by `created_at` DESC, limit
-      20), the page polls it every 5s. Rows are built as explicit plain objects (not the raw
-      libsql `Row` array-like value) before `JSON.stringify`, so the response has real field
-      names regardless of how `Row` serializes by default.
-- [x] Every other panel from the mockup (Detection Accuracy, Revenue Leakage, Mean Latency,
-      Throughput, Detection Method Mix, Payment Gateway Health) kept as illustrative mock data
-      **on purpose, per the user's explicit choice** — this system doesn't compute or track any
-      of those anywhere. A real "method mix" today would just be 100% RFID (ANPR doesn't exist
-      yet), and accuracy/leakage/latency aren't measured anywhere in the codebase. The page's
-      footer note and a "LIVE — TURSO" tag on the feed panel's heading say explicitly which part
-      is real, so this can't be misread as a fully-live dashboard.
-- [ ] Not yet done (needs Node/a real deploy target, same as `workers/charge`'s remaining
-      checklist): `npm install && npm run typecheck` — done, passes clean. Still needed:
-      `wrangler secret put DASHBOARD_PASSWORD` / `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN`, then
-      `wrangler deploy`, then a real browser check that Basic Auth actually gates access and the
-      feed populates against live Turso data.
-- [ ] Future "add more if needed" candidates, not started: computing Method Mix for real once
-      ANPR exists (trivial — `transactions.identification_method` is already tracked per row);
-      an actual Detection Accuracy/Revenue Leakage definition would need new tracking this
-      system doesn't have today, not just a dashboard query.
+      every request — this Worker serves real customer data (phone numbers via `vehicles`, plate
+      numbers) to whoever can reach the URL, unlike `workers/charge` which only ever receives
+      Paystack's own signed webhook calls.
+- [x] **Everything live now, single `GET /api/dashboard` call** (merged from what were
+      originally two separate endpoints, `/api/transactions` + `/api/metrics`, to halve
+      per-poll request volume — a code-review finding): transaction feed (`transactions` LEFT
+      JOIN `vehicles`, last 20), payment status breakdown → Total Transactions / Payment Success
+      Rate / Pending Charges tiles, Detection Method Mix (real `GROUP BY identification_method`
+      counts — currently 100% RFID since ANPR doesn't exist, which is now an honest live number
+      instead of a mocked-in 87/13 split), Throughput (real count of transactions in the last
+      hour), and a new **Recent Audit Events** panel (`audit_log`, last 8) that replaced the old
+      "Payment Gateway Health" panel — that one had no real signal to show (no uptime monitoring
+      of Paystack/Arkesel exists) and would have just been a second mock panel wearing a
+      different label.
+- [x] **Two tiles removed entirely, not faked as empty**: Detection Accuracy (no ground-truth
+      data exists anywhere to compare a detection against — there's nothing to compute, not even
+      in principle, without adding a whole separate verification mechanism) and Mean Latency
+      (`core/main.py` doesn't record per-transaction timing anywhere). The footer note explains
+      both, so their absence reads as "not tracked," not as a bug.
+- [x] Verified against the real empty database: `GET /api/dashboard` (authed) returns
+      `{"transactions":[],"total_transactions":0,"status_counts":{},"method_counts":{},"throughput_last_hour":0,"recent_events":[]}`
+      — clean, no errors — confirming every query handles the zero-rows case correctly, matching
+      "everything live even if it's empty."
+- [x] Code review before this second deploy (separate from the first pass) found and fixed:
+      a **stored XSS** in the very first live-data version (unescaped `plate_number` in the feed,
+      caught before that version ever shipped); after the metrics rewrite, a second pass found
+      two more spots where escaping had been missed on new code (`refreshFeed`'s catch-block
+      error text, `formatTime`'s invalid-date fallback) and fixed both; a `renderMethodMix` bug
+      where a hardcoded `['RFID','ANPR','NONE']` list would've silently under-represented the mix
+      if `identification_method` ever held any other value (fixed to iterate whatever keys Turso
+      actually returns); a `refreshMetrics` failure path that only reset one of six live elements
+      on fetch failure, leaving the rest showing stale numbers with no indication (fixed with a
+      single `markStale()` that clears every live element together); a stale top-of-file doc
+      comment claiming panels were still mock after they'd been wired live (updated); and added a
+      guard inside `getTursoClient()` itself so a future call site can't skip the
+      Turso-configured check and permanently poison a Worker isolate's cached client.
+- [x] The Turso-credential-rotation trade-off noted right after the first deploy got a real fix,
+      not just a documented workaround: `getTursoClient()` now keys its cached client on the
+      actual `url+token` pair (not just "have we built one yet"), so a rotated
+      `TURSO_AUTH_TOKEN` takes effect on the very next request instead of requiring a manual
+      `wrangler deploy` to force isolate recycling. Redeployed and reverified live afterward
+      (auth still gates correctly, `/api/dashboard` still returns clean empty JSON).
+- [ ] Future, not started: once ANPR (Phase 5) exists, Method Mix will show real non-zero ANPR
+      percentages with no code changes needed — the query is already correct for that case.
+
+## Real end-to-end pass + `core.main --uid` sync gap — 2026-08-15 — DONE
+
+Full chain run for real for the first time (previously only the isolated `charge_toll()` call
+had been live-tested): registered a real test vehicle
+(`--phone 0551234987 --rfid-uid TESTUID01 --plate GT-9999-26`, Paystack's designated test
+number), ran `python3 -m core.main --uid TESTUID01`, got a real `SUCCESS` charge. Both the
+`vehicles` row and the resulting `transactions` row were independently confirmed present on the
+real Turso database via a separate replica connection — not just "no error was printed."
+
+- [x] **Real gap found**: the vehicle synced to Turso, but the transaction initially didn't —
+      `python3 -m core.main --uid <UID>` is a one-shot process; `init_db()`'s startup sync runs
+      *before* the transaction is created, and the process exits well before the background
+      thread's first `TURSO_SYNC_INTERVAL_SECONDS` tick (default 30s — daemon threads are
+      killed outright on interpreter exit, not given a chance to finish). The transaction sat
+      local-only until a later process's own startup sync happened to sweep it up. This only
+      affects the `--uid` dev-mode testing path, not the real hardware loop (`run_hardware_loop`
+      stays alive, so the background thread runs normally there) — but it meant every dev-mode
+      test run needed a manual follow-up sync to actually show up on Turso/the dashboard.
+- [x] **Fixed** in `core/main.py`: one explicit best-effort `_sync_once()` call added in two
+      places — right after `--uid` mode's `handle_uid()` call before the process exits, and in
+      `run_hardware_loop()`'s `finally` block after `reader.cleanup()` (so a graceful
+      `systemctl stop`/restart on the Pi doesn't leave up to ~30s of the most recent activity
+      unsynced either, even though the background thread already covers the common case there).
+      Safe unconditionally — `_sync_once()` no-ops without Turso configured and never raises if
+      unreachable. All 14 tests still pass.
+- [x] Confirmed both sync directions work, not just the push side already exercised by
+      `scripts/test_turso_sync.py`: wrote a row directly to remote Turso (bypassing local
+      entirely, same effect as editing it in Turso's web console) and confirmed a local
+      `get_vehicle_by_rfid()` call found it after a sync — i.e. registering a vehicle via
+      Turso's own console instead of `scripts/register_vehicle.py` is a legitimate second path,
+      as long as `vehicle_type` is kept to one of `car`/`suv`/`bus`/`truck` (the `toll_rates`
+      foreign key enforces this locally, but a console-side insert won't be caught until the
+      toll-rate lookup runs).
+- [x] **A file corruption incident happened and was resolved** during this work: a background
+      agent's edit to `workers/dashboard/src/index.ts` introduced a single literal NUL byte
+      into the `getTursoClient()` cache-key line (`${env.TURSO_DATABASE_URL}\0${env.TURSO_AUTH_TOKEN}`
+      instead of a space-separated string), which made `git`/`file` classify the whole file as
+      binary. Fixed by replacing the NUL byte with the originally-intended space and
+      reverifying: valid UTF-8 again, `tsc --noEmit` clean, redeployed, live endpoints
+      reverified. Worth remembering if this ever recurs: check for embedded NUL bytes
+      specifically (`data.count(b'\x00')` in Python) before assuming a "binary" git diff on a
+      source file means something more exotic.
