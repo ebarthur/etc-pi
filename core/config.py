@@ -17,6 +17,15 @@ RFID_TIMEOUT_SECONDS = 2.0
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "")
 PAYSTACK_BASE_URL = "https://api.paystack.co"
 
+# --- Turso (libSQL embedded replica) ---
+# Both unset -> core/db.py falls back to a plain local file (dev/test, no
+# network involved). Both set -> vehicles/toll_rates sync down from Turso
+# and transactions/audit_log sync up, in the background, on a schedule set
+# by TURSO_SYNC_INTERVAL_SECONDS. See plan.md Phase 4.
+TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL", "")
+TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
+TURSO_SYNC_INTERVAL_SECONDS = float(os.environ.get("TURSO_SYNC_INTERVAL_SECONDS") or "30")
+
 # --- SMS (Arkesel) ---
 ARKESEL_API_KEY = os.environ.get("ARKESEL_API_KEY", "")
 # Arkesel sender IDs must be pre-registered/approved with Arkesel and are capped at 11

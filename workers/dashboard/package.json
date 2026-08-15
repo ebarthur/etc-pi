@@ -1,0 +1,19 @@
+{
+  "name": "smart-toll-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Cloudflare Worker: Toll Ops audit dashboard",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@libsql/client": "0.17.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260814.1",
+    "typescript": "7.0.2",
+    "wrangler": "4.123.0"
+  }
+}

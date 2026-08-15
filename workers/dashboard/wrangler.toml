@@ -1,0 +1,17 @@
+# workers/dashboard — Toll Ops audit dashboard (plan.md, dashboard section).
+#
+# Secrets (never put these here — set via `wrangler secret put <NAME>`,
+# same "real values never committed" rule as the repo's .env):
+#   DASHBOARD_PASSWORD    shared password gating every request (HTTP Basic
+#                         Auth) — this reads real customer data (phone
+#                         numbers, plates via vehicles), unlike
+#                         workers/charge which only ever receives Paystack's
+#                         own signed webhook calls, so it must never be
+#                         reachable without this.
+#   TURSO_DATABASE_URL    same value as core/.env's TURSO_DATABASE_URL
+#   TURSO_AUTH_TOKEN      Turso auth token for that database (read-only
+#                         usage here — this Worker never writes)
+
+name = "smart-toll-dashboard"
+main = "src/index.ts"
+compatibility_date = "2026-08-14"

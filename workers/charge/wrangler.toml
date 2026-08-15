@@ -1,0 +1,11 @@
+# workers/charge — Paystack webhook receiver (plan.md Phase 3).
+#
+# Secrets (never put these here — set via `wrangler secret put <NAME>`,
+# same "real values never committed" rule as the repo's .env):
+#   PAYSTACK_SECRET_KEY   same value as core/.env's PAYSTACK_SECRET_KEY
+#   TURSO_DATABASE_URL    e.g. libsql://<db-name>-<org>.turso.io
+#   TURSO_AUTH_TOKEN      Turso auth token for that database
+
+name = "smart-toll-charge-webhook"
+main = "src/index.ts"
+compatibility_date = "2026-08-14"

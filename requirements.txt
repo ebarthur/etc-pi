@@ -9,3 +9,11 @@ picamera2==0.3.37
 python-dotenv==1.2.2
 requests==2.34.2
 opencv-python-headless==4.14.0.94
+# libsql has no prebuilt wheel for Linux aarch64 (Raspberry Pi OS 64-bit) on PyPI as of
+# this pin — only macOS arm64, Windows, and Linux x86_64. pip falls back to building from
+# source, which needs `cmake` (`sudo apt install cmake`) plus a C/C++ toolchain (`build-essential`,
+# already pulled in by most things); it does NOT need a manually-installed Rust toolchain —
+# libsql's build backend (maturin) auto-bootstraps one into ~/.cache/puccinialin on first
+# build. Expect the first `pip install` to take several minutes and real CPU/RAM on a Pi;
+# it's a one-time cost, not a runtime one. See scripts/setup_pi.sh.
+libsql==0.1.11

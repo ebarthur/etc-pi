@@ -47,8 +47,18 @@ def _patch_http(monkeypatch, paystack_data=PAYSTACK_SUCCESS, arkesel_data=ARKESE
 
 @pytest.fixture(autouse=True)
 def throwaway_db(tmp_path, monkeypatch):
-    """Point core.db at a fresh SQLite file per test instead of db/tolling.db."""
+    """Point core.db at a fresh SQLite file per test instead of db/tolling.db.
+
+    Also blanks Turso config before init_db() runs: this module's Paystack/
+    Arkesel HTTP mocking only keeps the suite offline if init_db() doesn't
+    separately reach out to a real Turso DB — which it otherwise would
+    whenever real TURSO_DATABASE_URL/TURSO_AUTH_TOKEN are set in .env (a real
+    account is now configured for Phase 9 live testing; this suite must stay
+    offline and deterministic regardless).
+    """
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test_tolling.db")
+    monkeypatch.setattr(db, "TURSO_DATABASE_URL", "")
+    monkeypatch.setattr(db, "TURSO_AUTH_TOKEN", "")
     db.init_db()
 
 
@@ -125,6 +135,7 @@ def test_pending_charge_leaves_transaction_pending(monkeypatch):
         ).fetchone()
 
     assert txn["payment_status"] == "PENDING"
+    assert txn["momo_reference"] == "ref_pending"
     assert audit_row is not None
 
 

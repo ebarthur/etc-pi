@@ -8,8 +8,9 @@ venv/
 anpr/models/*.pt
 anpr/captures/*
 
-# Local DB
+# Local DB (includes libsql's embedded-replica sidecar files: -info, -wal, -shm)
 db/*.db
+db/*.db-*
 
 # Dead directory — filesystem corruption made it unreadable/undeletable (needs e2fsck to
 # reclaim). Mock data now lives in api_clients/fixtures/ instead.

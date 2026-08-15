@@ -59,7 +59,14 @@ def charge_toll(
     amount_pesewas = int(round(amount_ghs * 100))
 
     payload = {
-        "email": f"{phone_number}@smarttoll.local",  # Paystack requires an email field
+        # Paystack requires an email field but never delivers to it for a
+        # mobile money charge. Must not use a reserved special-use TLD
+        # (.local/.test/.invalid/etc, RFC 2606/6761/6762) — confirmed
+        # empirically Paystack's validator rejects those specifically with
+        # "Invalid Email Address Passed" regardless of the rest of the
+        # address; it does not check whether the domain actually resolves,
+        # so any ordinary public TLD works even if unregistered.
+        "email": f"{phone_number}@smarttoll.com",
         "amount": amount_pesewas,
         "currency": "GHS",
         "mobile_money": {

@@ -28,6 +28,7 @@ from core.db import (
     init_db,
     log_audit_event,
     log_transaction,
+    set_transaction_reference,
     update_transaction_status,
 )
 
@@ -60,7 +61,10 @@ def handle_uid(uid: str) -> None:
     if result["status"] == "pending":
         # MoMo charges are frequently asynchronous. Leave the transaction as
         # PENDING (its default) — Phase 3's Paystack webhook resolves it to
-        # SUCCESS/FAILED once the charge actually completes.
+        # SUCCESS/FAILED once the charge actually completes. It matches by
+        # momo_reference, so that has to land on the row now, not just in
+        # this audit log entry.
+        set_transaction_reference(transaction_id, result["reference"])
         log_audit_event(
             "CHARGE_PENDING", event_detail=result["reference"], transaction_id=transaction_id
         )
