@@ -50,3 +50,24 @@ ANPR_MODEL_PATH = str(
     Path(__file__).resolve().parent.parent / "anpr" / "models" / "plate_detector.pt"
 )
 ANPR_CAPTURE_DIR = Path(__file__).resolve().parent.parent / "anpr" / "captures"
+
+# --- Vehicle presence (sensors/presence.py) ---
+# No dedicated presence sensor (IR break-beam, ultrasonic, inductive loop) is
+# available yet, so the camera doubles as the trigger via frame-differencing.
+# Threshold/sustain values below were picked from a real empirical baseline on
+# this hardware, 2026-08-15: 20 consecutive frames of a static scene at
+# (640, 480) measured a mean-abs-pixel-diff noise floor of ~2.2-3.3 (0-255
+# scale) between consecutive frames. PRESENCE_MOTION_THRESHOLD sits well above
+# that (~3x the observed max), not guessed blind. Re-tune in the field once a
+# real vehicle approach is observable, and swap this whole module out for
+# real presence hardware if/when one is available.
+PRESENCE_RESOLUTION = (640, 480)
+PRESENCE_MOTION_THRESHOLD = 10.0
+PRESENCE_POLL_INTERVAL_SECONDS = 0.15
+# Consecutive above-threshold frames required before treating it as a real
+# vehicle arrival rather than single-frame noise/a glitch.
+PRESENCE_SUSTAIN_FRAMES = 3
+# Consecutive below-threshold frames required before re-arming, so a vehicle
+# that's still sitting in frame (e.g. mid-charge) doesn't immediately
+# retrigger a second detection.
+PRESENCE_CLEAR_FRAMES = 5

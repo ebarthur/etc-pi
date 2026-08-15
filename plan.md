@@ -1,10 +1,47 @@
 # Smart Toll — Build Plan
 
-Status: everything buildable without real credentials/hardware is done — Phases 0-4 (core
-loop, tests, Paystack webhook, Turso sync) and Phase 8 (Pi deployment script + log capping).
-Phase 5 (ANPR) stays blocked on trained models that don't exist yet; Phases 6-7 (identity
-verification, SMS approval) are explicitly out of scope per this plan's own locked decisions,
-not started. Everything else that's left needs something only you can provide — see Phase 9.
+Status (2026-08-15): code-side is done and now running on the actual target hardware (this
+Pi). RFID + camera + Turso sync + both Cloudflare Workers are live; a vehicle-presence
+trigger (camera-based, since no dedicated sensor exists) gates the whole flow. One real
+hardware fault is open (RC522 antenna, see below) and blocks RFID from actually charging
+anyone right now. Phase 5 (ANPR) stays blocked on trained models; Phases 6-7 (identity
+verification, SMS approval) are explicitly out of scope per this plan's own locked decisions.
+
+## Next session — pick up here
+
+1. **RFID antenna fault (blocking)** — `TxControlReg` refuses to enable no matter what's
+   written to it; every other register works. This is the chip's own antenna
+   overcurrent/short protection, not a code or general-wiring issue. Full register-level
+   evidence is in "Pi hardware bring-up" below. **Needs physical action from you**: inspect
+   the antenna coil trace/solder joints on the RC522 board for damage, or swap in a second
+   RC522 module if you can get one, then ask to re-run the same isolated diagnostic script
+   (was throwaway code this session — ask to have it promoted to
+   `scripts/test_rfid_hardware.py` if it's needed again). Until this is fixed, every real
+   vehicle arrival falls through to the ANPR-capture path (which works) — no tag will ever
+   be read.
+2. **SD card is actively corrupting data (blocking, ongoing risk)** — `dmesg` shows real
+   ext4 errors on `mmcblk0p2` (bad block bitmap checksums, a corrupt inode bitmap, failed
+   CRC checks). Already caused one full-file garbage-overwrite of an uncommitted `plan.md`
+   this session. **Back up `.env` and `db/tolling.db` off this card now if you haven't**,
+   and plan to reflash/replace the card — expect more corruption until then. Check
+   `git status`/`file <path>` on anything uncommitted before trusting it's intact.
+3. **Point Paystack's webhook** (dashboard → Settings → API Keys & Webhooks) at
+   `https://smart-toll-charge-webhook.steam67.workers.dev` — dashboard-only, no API for it.
+   Then trigger one real mobile money charge and confirm it resolves PENDING -> SUCCESS/FAILED
+   with a `WEBHOOK_CHARGE_RESOLVED` audit row.
+4. **Rotate the Cloudflare API token** — a real `CLOUDFLARE_API_TOKEN` is sitting in
+   plaintext in `~/.bashrc` (and bash history) from an earlier session. Flagged, not
+   touched — user said they'd handle it themselves.
+5. Once RFID is physically fixed: re-test the full trigger -> RFID -> charge -> SMS chain
+   for real (motion trigger + presence debounce are already verified live; only the RFID
+   leg of it is currently blocked by the hardware fault above).
+6. Phase 5 (ANPR) whenever trained `.pt` models exist — `anpr/yolov11.py` is still an empty
+   stub; `sensors/presence.py`'s `capture_fallback_frame()` already saves real frames to
+   `anpr/captures/` today, at 640x480, ~90-degree-rotated from upright (physical mount
+   orientation) — fix the rotation in the capture config as part of that work, not before.
+
+Everything else that's left needs something only you can provide — see Phase 9 below for
+the fuller per-system breakdown.
 
 ## Context / decisions this plan assumes
 
@@ -525,3 +562,125 @@ real Turso database via a separate replica connection — not just "no error was
       reverified. Worth remembering if this ever recurs: check for embedded NUL bytes
       specifically (`data.count(b'\x00')` in Python) before assuming a "binary" git diff on a
       source file means something more exotic.
+
+## Pi hardware bring-up — 2026-08-15 — service running, real corruption diagnosed
+
+Continuing Phase 8/9 on the actual target hardware (this box is now the Pi itself, per
+`git clone git@github.com:ebarthur/etc-pi.git etc` in shell history — `setup_pi.sh` had
+already been run: SPI enabled, `gpio`/`spi` groups present, `smart-toll.service` installed
+and enabled).
+
+- [x] **Root-caused a second, more severe corruption**: this file's uncommitted working copy
+      (and, separately, an unrelated `~/.claude` memory file on the same disk) had been fully
+      overwritten with high-entropy random bytes — not a single stray NUL byte like the
+      `index.ts` incident above, the *entire* file. `dmesg` shows why: the root filesystem
+      (`mmcblk0p2`, the SD card) has active `EXT4-fs error`s — bad block bitmap checksums, a
+      corrupt inode bitmap, and failed CRC checks — a genuine hardware/storage fault, not
+      anything an edit did. This matches the Phase 0 note above about prior SD corruption on
+      this same box. Fixed by restoring `plan.md` from the last clean commit (`9af7968`); the
+      corrupted portion was unreadable garbage, nothing recoverable was lost. **Not fixed**:
+      the underlying SD card fault itself — `fsck` on a live root fs was ruled out (same reason
+      as the Phase 0 note), so it's still throwing CRC errors on writes. Recommend backing up
+      `.env`/`db/tolling.db`/anything uncommitted and planning to reflash/replace the card;
+      until then, expect more corruption like this.
+- [x] **`smart-toll.service` was crash-looping** (~99 restarts, `ModuleNotFoundError: No
+      module named 'libsql'`): the systemd unit's venv (`venv/`, `--system-site-packages`,
+      created by `setup_pi.sh`) never actually had `pip install -r requirements.txt` completed
+      — missing `mfrc522`, `libsql`, `opencv-python-headless` was shadowed by ultralytics'
+      newer `opencv-python` pull, etc. (A separate, older `.venv/` from earlier dev-machine
+      testing did have everything, but isn't what the systemd unit points at.) Stopped the
+      service first to stop hammering the already-faulting card with a restart every ~5s, then
+      ran `venv/bin/pip install -r requirements.txt` (a cached `libsql` wheel meant no
+      multi-minute source build was actually needed this time) and restarted the service —
+      confirmed `active (running)`, no further crashes.
+- [ ] **RFID hardware fault found, not yet resolved**: an actual physical RFID tag scan against
+      the running hardware loop was attempted with both tags from the kit (the card and the blue
+      keyfob) — neither was ever detected, 0 hits across 500+ `MFRC522_Request(PICC_REQIDL)`
+      polls with a tag held directly against the reader. Root-caused via direct register access
+      (bypassing `rfid/reader.py`, talking to the `mfrc522` library directly):
+        - Basic SPI communication is fine — `VersionReg` (0x37) reads a consistent `0xB2` across
+          15 back-to-back reads, and an arbitrary scratch register (`ModeWidthReg`, 0x24)
+          correctly writes and reads back a test pattern (`0x55`). So this isn't a general
+          MISO/MOSI/SCK/CS wiring problem, and reads aren't the issue.
+        - `TxControlReg` (0x14, the antenna-driver-enable register) is the one exception: it
+          reads `0x80` (antenna drivers off) both before and *after* an explicit direct write of
+          `0x83` (the value `AntennaOn()` is supposed to set) — the write to this one specific
+          register silently doesn't take, while every other register write does. This is the
+          RC522's own overcurrent/short-circuit protection on the antenna output (TX1/TX2)
+          refusing to enable — not a code bug (`rfid/reader.py`/`mfrc522`'s `AntennaOn()` logic
+          is correct; it's the chip refusing at the hardware level) and not a general wiring
+          bug (everything else on the SPI bus works).
+        - The board's red LED being lit is not evidence against this — on this class of cheap
+          RC522 breakout it's just a power-present indicator, not an antenna/RF-status light,
+          and doesn't change the register-level finding above.
+      **Likely cause**: a fault in the antenna itself. On this board style the antenna is a
+      printed copper coil on the PCB (not a separate/detachable module), so the next physical
+      checks are: visible damage/crack/burn on the coil trace, a cold solder joint near it, or
+      — most likely for a low-cost clone board — a dead unit. **Parked pending physical
+      inspection or a second RC522 module to swap in and re-test against** (same isolated
+      register-level script, not yet turned into a permanent `scripts/` file since it was
+      throwaway diagnostic code — worth promoting to `scripts/test_rfid_hardware.py` if this
+      kind of check is needed again).
+- [x] **Camera checked — works.** `Picamera2.global_camera_info()` detects an IMX708 (Camera
+      Module 3) sensor cleanly, and a real still capture (`create_still_configuration()` +
+      `capture_file()`) succeeded at full native resolution (4608x2592), verified as a valid,
+      openable JPEG (`PIL.Image.verify()`), not a stub/corrupt file. Unrelated to the RFID
+      fault above — this is a separate camera on a separate interface (CSI, not SPI), and it's
+      fine. **One thing to fix before Phase 5 (ANPR) starts**: the captured image comes out
+      rotated ~90° from upright based on how the module is physically mounted, even though the
+      sensor's own `Rotation: 180` metadata doesn't reflect that — the capture config will need
+      an explicit rotation/transform (or a physical remount) once real plate-detection frames
+      matter; not a blocker today since Phase 5 is still waiting on the user's trained models.
+- [ ] Not yet done: pointing Paystack's webhook at the deployed Worker (Phase 9, dashboard-only
+      step) and the SD card replacement/reflash above.
+
+## Vehicle-presence trigger (`sensors/presence.py`) — 2026-08-15 — DONE, verified live
+
+Gap identified while testing RFID above: `run_hardware_loop()` free-polled the RC522 every
+`RFID_TIMEOUT_SECONDS` (2s) forever, with no concept of "a vehicle actually arrived" — if
+ANPR fallback were wired into the old `handle_no_tag()` as-is, it would've fired on every
+idle poll, camera running/inferencing around the clock for no reason. No dedicated presence
+hardware (IR break-beam, ultrasonic, inductive loop) is available and there wasn't time to
+source one, so the already-working camera doubles as the trigger instead, via frame-differencing.
+
+- [x] **`core/config.py`**: added `PRESENCE_*` constants. Threshold picked from a real
+      measured baseline on this hardware, not guessed — 20 consecutive frames of a static
+      scene at (640, 480) gave a mean-abs-pixel-diff noise floor of ~2.2-3.3 (0-255 scale);
+      `PRESENCE_MOTION_THRESHOLD=10.0` sits ~3x above that. `PRESENCE_SUSTAIN_FRAMES=3` /
+      `PRESENCE_CLEAR_FRAMES=5` debounce single-frame noise on arrival/departure.
+- [x] **`sensors/presence.py`** (new): `PresenceSensor` with a hardware-agnostic interface
+      (`wait_for_vehicle()` / `wait_until_clear()` / `capture_fallback_frame()` /
+      `cleanup()`) so a real presence sensor could swap in later without touching
+      `core/main.py`. Diffs consecutive low-res (640x480) grayscale frames against each
+      other, not against a fixed baseline — deliberately: a vehicle that arrives and then
+      stops should still register via the *arrival* motion (multiple consecutive changing
+      frames while it's still moving into position), not via a persistent large diff from
+      some fixed reference, which would never settle back to "clear" while the vehicle
+      just sits there. Documented limitation: this only works if the vehicle is still
+      moving across at least `PRESENCE_SUSTAIN_FRAMES` poll cycles (~0.45s at defaults)
+      during approach — true for realistic vehicle speeds, but an extremely slow creep
+      could miss it. A real presence sensor wouldn't have this limitation if it's ever
+      worth swapping in.
+- [x] **`core/main.py`** restructured: `run_hardware_loop()` now blocks on
+      `presence.wait_for_vehicle()` before opening the RFID window, and on a timeout
+      (no tag) captures a real fallback frame to `anpr/captures/<timestamp>.jpg` and passes
+      the path into `handle_no_tag()` for the audit log — actual ANPR inference still isn't
+      wired in (Phase 5 still blocked on the user's trained models), but the capture point
+      now exists and is exercised for real. `presence.wait_until_clear()` debounces re-arming
+      after each vehicle.
+- [x] **Tests**: `tests/test_presence.py` (5 tests) against a mocked `Picamera2` — frame-diff
+      math runs for real (real numpy), only the camera hardware is faked, matching the
+      existing `tests/test_rfid.py` pattern. `tests/conftest.py` extended to stub
+      `picamera2` the same way `RPi.GPIO`/`mfrc522` already were. `numpy==2.2.4` added to
+      `requirements.txt` as a direct dependency (was only ever transitive before, via
+      opencv/ultralytics) and installed into both venvs. All 19 tests pass (14 previous + 5
+      new).
+- [x] **Verified live end-to-end**, not just unit-tested: measured real frame-diff noise on
+      this exact camera over 15s idle (stayed 2.6-3.65, well under the 10.0 threshold — no
+      false triggers at rest), then ran the actual `smart-toll.service` with the new code,
+      waved a hand in front of the camera, and confirmed via `journalctl` that it triggered,
+      opened the RFID window, timed out (RFID hardware still faulty, see above), and saved a
+      real fallback capture — independently reverified that file with `PIL.Image.verify()`
+      (`640x480`, valid JPEG, not a stub). Idle behavior changed too: the service no longer
+      logs anything at all while genuinely idle (no vehicle present), versus the old
+      every-2-seconds `RFID_TIMEOUT` spam.

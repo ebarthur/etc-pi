@@ -1,5 +1,10 @@
 mfrc522==0.0.7
 RPi.GPIO==0.7.1
+# Direct dep of sensors/presence.py's frame-diff math. Was already present
+# transitively (opencv/ultralytics pull it in via apt system-site-packages on
+# the Pi's venv), but a module that imports it directly shouldn't rely on
+# that being incidental.
+numpy==2.2.4
 # No OCR library here on purpose: both the plate detector and the OCR step will run from
 # custom-trained .pt models (not a generic pretrained OCR engine like easyocr), decided
 # 2026-08-15 — see plan.md Phase 5. ultralytics covers the YOLO detector; if the OCR model
