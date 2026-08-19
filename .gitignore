@@ -5,8 +5,17 @@ venv/
 .venv/
 
 # Models & captured data (large/binary)
+# The trained models sit directly in anpr/ (anpr/crop.pt ~5.4MB, anpr/ocr.ckpt
+# ~353MB), NOT in an anpr/models/ subdirectory — the old `anpr/models/*.pt`
+# pattern matched neither, so both files showed up as untracked and the 353MB
+# checkpoint was one `git add -A` away from being committed. Match what's
+# actually on disk, and cover .ckpt as well as .pt.
+anpr/*.pt
+anpr/*.ckpt
 anpr/models/*.pt
 anpr/captures/*
+# Roadside ANPR live-test output (frames, crops, JSONL) — see anpr/live_test.py
+anpr/live_runs/
 
 # Local DB (includes libsql's embedded-replica sidecar files: -info, -wal, -shm)
 db/*.db

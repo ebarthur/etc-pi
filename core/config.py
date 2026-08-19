@@ -46,10 +46,33 @@ TOLL_RATES = {
 DEFAULT_TOLL_RATE = TOLL_RATES["car"]
 
 # --- ANPR ---
-ANPR_MODEL_PATH = str(
-    Path(__file__).resolve().parent.parent / "anpr" / "models" / "plate_detector.pt"
-)
-ANPR_CAPTURE_DIR = Path(__file__).resolve().parent.parent / "anpr" / "captures"
+# Two separate models, two different frameworks — confirmed 2026-08-19 by
+# inspecting the pickled class refs inside each file:
+#   crop.pt   ultralytics YOLOv11n DetectionModel (run 'yolo11n_lpr_run1'),
+#             detects the plate region. Loads with ultralytics.YOLO().
+#   ocr.ckpt  PARSeq (https://github.com/baudm/parseq) scene-text-recognition
+#             model saved as a full PyTorch Lightning checkpoint — state_dict
+#             plus optimizer/scheduler/epoch state and a `hyper_parameters`
+#             block. NOT a YOLO model and NOT loadable by ultralytics; it
+#             needs the PARSeq architecture rebuilt from those hparams. See
+#             anpr/parseq_infer.py.
+# Both live directly in anpr/, not the anpr/models/ subdirectory an earlier
+# draft of this file assumed (that path never existed on disk).
+_ANPR_DIR = Path(__file__).resolve().parent.parent / "anpr"
+ANPR_DETECTOR_PATH = str(_ANPR_DIR / "crop.pt")
+ANPR_OCR_CHECKPOINT_PATH = str(_ANPR_DIR / "ocr.ckpt")
+ANPR_CAPTURE_DIR = _ANPR_DIR / "captures"
+
+# Minimum YOLO box confidence before a detected region is worth running OCR
+# on. Deliberately low — the detector is single-class (plate/not-plate) and
+# the OCR step has its own confidence gate below, so a permissive detector
+# threshold costs little and avoids dropping small/distant plates outright.
+ANPR_DETECTOR_CONFIDENCE = 0.25
+# Minimum mean per-character OCR confidence before a plate read is treated as
+# usable rather than a guess. The trained checkpoint reports val_accuracy
+# ~23.8% (epoch 43-45), so a large share of reads will legitimately fall
+# below this — that's the model's current quality, not a bug in the gate.
+ANPR_OCR_MIN_CONFIDENCE = 0.5
 
 # --- Vehicle presence (sensors/presence.py) ---
 # No dedicated presence sensor (IR break-beam, ultrasonic, inductive loop) is

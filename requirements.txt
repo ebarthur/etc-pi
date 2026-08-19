@@ -5,13 +5,30 @@ RPi.GPIO==0.7.1
 # the Pi's venv), but a module that imports it directly shouldn't rely on
 # that being incidental.
 numpy==2.2.4
-# No OCR library here on purpose: both the plate detector and the OCR step will run from
-# custom-trained .pt models (not a generic pretrained OCR engine like easyocr), decided
-# 2026-08-15 — see plan.md Phase 5. ultralytics covers the YOLO detector; if the OCR model
-# turns out to also be a YOLO-format model, ultralytics covers that too with no new
-# dependency. Add torch/torchvision explicitly if the OCR model turns out to be a
-# non-YOLO custom architecture loaded via a raw torch.load() instead.
+# No OCR library here on purpose: both the plate detector and the OCR step run from
+# custom-trained models (not a generic pretrained OCR engine like easyocr), decided
+# 2026-08-15 — see plan.md Phase 5. ultralytics covers the YOLO detector (anpr/crop.pt).
+#
+# RESOLVED 2026-08-19: the OCR model is NOT YOLO-format, so ultralytics does not cover it.
+# anpr/ocr.ckpt is a PARSeq PyTorch Lightning checkpoint, which needs torch + timm (the
+# ViT encoder) — see anpr/parseq_infer.py. pytorch-lightning itself is deliberately NOT a
+# dependency: parseq_infer.py rebuilds the architecture as plain nn.Modules from the
+# hyper_parameters stored inside the checkpoint and loads the weights directly, so the Pi
+# never installs a training framework it only needs at inference.
 ultralytics==8.4.118
+# timm supplies the VisionTransformer that PARSeq's encoder subclasses. Unpinned
+# deliberately — parseq_infer.py's strict=True state_dict load fails loudly at startup if
+# a timm version ever changes the ViT module layout, so a silent mismatch isn't possible.
+timm
+#
+# torch/torchvision are NOT pinned here on purpose. ultralytics pulls them in transitively,
+# and letting pip resolve that unaided on this box installs the full CUDA build
+# (torch + nvidia_cudnn_cu13 + cuda_toolkit, ~900MB) — useless on a Pi with no NVIDIA GPU
+# and a large pile of pointless SD-card writes. Install the CPU wheels FIRST, from
+# PyTorch's CPU index, so they're already satisfied when ultralytics resolves:
+#     pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+# scripts/setup_pi.sh does this automatically; do it by hand before `pip install -r` if
+# you're setting a venv up yourself.
 # picamera2 is best installed via apt on Raspberry Pi OS (`python3-picamera2`) since it
 # binds against the system libcamera install — the pip version is a fallback for venvs
 # with --system-site-packages, not a from-scratch source build on a Pi.

@@ -47,6 +47,13 @@ echo "==> Creating virtualenv and installing Python dependencies"
 # system libcamera and isn't meant to be pip-installed on a Pi — see requirements.txt).
 sudo -u "$RUN_USER" python3 -m venv --system-site-packages "$REPO_DIR/venv"
 sudo -u "$RUN_USER" "$REPO_DIR/venv/bin/pip" install --upgrade pip
+# PyTorch CPU wheels FIRST, explicitly. ultralytics (requirements.txt) depends on torch,
+# and resolving that unaided on this box pulls the full CUDA build (torch +
+# nvidia_cudnn_cu13 + cuda_toolkit, ~900MB) — useless on a Pi with no NVIDIA GPU, and a
+# large pile of pointless SD-card writes. Installing the CPU wheel up front means the
+# requirement is already satisfied by the time ultralytics is resolved below.
+sudo -u "$RUN_USER" "$REPO_DIR/venv/bin/pip" install \
+  --index-url https://download.pytorch.org/whl/cpu torch torchvision
 sudo -u "$RUN_USER" "$REPO_DIR/venv/bin/pip" install -r "$REPO_DIR/requirements.txt"
 
 echo "==> Installing systemd service"
