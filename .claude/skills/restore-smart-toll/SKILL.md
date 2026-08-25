@@ -77,24 +77,40 @@ any uncommitted changes (`git status` first).
    venv/bin/pip install --upgrade pip
    ```
 
-5. **Install PyTorch CPU-only FIRST, explicitly** — this is the one real
-   pitfall hit during the 2026-08-15 session. `ultralytics` (in
+5. **Install PyTorch CPU-only FIRST, explicitly** — this is one of two real
+   pitfalls hit during the 2026-08-15 session. `ultralytics` (in
    `requirements.txt`) pulls in `torch` transitively, and letting pip resolve
    that on its own on this box pulled the full **CUDA** build
    (`torch-2.13.0` + `nvidia_cudnn_cu13` + `cuda_toolkit`, ~900MB) — useless
    on a Pi with no NVIDIA GPU, and a huge waste of time/SD-card writes. Force
-   the CPU wheel first so it's already satisfied when `ultralytics` resolves:
+   the CPU wheel first so it's already satisfied when `ultralytics` resolves —
+   **install `torchvision` in this same command, not just `torch`**: doing
+   `torch` alone here (as an earlier version of this doc said) leaves
+   `torchvision` to be resolved later from a generic PyPI index, which built
+   against a different ABI than the `+cpu` torch wheel and broke
+   `torchvision::nms` at import time (`RuntimeError: operator
+   torchvision::nms does not exist`, surfaced as 3 failing tests in
+   `tests/test_anpr.py` during the 2026-08-25 restore) — `scripts/setup_pi.sh`
+   already gets this right by installing both together:
    ```
-   venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
+   venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
    venv/bin/pip install -r requirements.txt -r requirements-dev.txt
    ```
+   If you do end up with a mismatched `torchvision`, fix forward rather than
+   reinstalling everything: `venv/bin/pip install --index-url
+   https://download.pytorch.org/whl/cpu --force-reinstall --no-deps
+   torchvision`.
 
 6. **Run `scripts/setup_pi.sh`** (idempotent, root) for the rest: SPI enable
    for the RC522, `gpio`/`spi` group membership, the `smart-toll.service`
    systemd unit, journald caps.
 
-7. **Verify**: `git status` clean, `pytest` passes, `python3 -m core.main
-   --uid <test-uid>` runs without error (dev mode, no hardware needed).
+7. **Verify**: `git status` clean, `venv/bin/python -m pytest` passes (use
+   `python -m pytest`, not the bare `pytest` binary — the project has no
+   `conftest.py`/`pyproject.toml` adding the repo root to `sys.path`, so the
+   bare binary fails every test module with `ModuleNotFoundError: No module
+   named 'core'` etc.), `venv/bin/python -m core.main --uid <test-uid>` runs
+   without error (dev mode, no hardware needed).
 
 ## Where Phase 5 (ANPR) integration actually stood, 2026-08-15
 
