@@ -31,6 +31,7 @@ import logging
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
+import cv2
 import numpy as np
 
 from core.config import (
@@ -41,6 +42,24 @@ from core.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+_ROTATIONS = {
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+
+def rotate_frame(frame: np.ndarray, degrees: int) -> np.ndarray:
+    """Rotate clockwise by 0/90/180/270 degrees. 0 is a no-op passthrough.
+
+    Shared by sensors/presence.py (real-time capture) and anpr/live_test.py
+    (roadside data collection) so a camera remount only needs recalibrating
+    (ANPR_CAPTURE_ROTATION in core/config.py) in one place, not two.
+    """
+    if degrees == 0:
+        return frame
+    return cv2.rotate(frame, _ROTATIONS[degrees])
 
 
 @dataclass(frozen=True)

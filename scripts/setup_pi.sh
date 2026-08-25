@@ -67,6 +67,7 @@ Wants=network-online.target
 Type=simple
 User=$RUN_USER
 WorkingDirectory=$REPO_DIR
+Environment=PYTHONUNBUFFERED=1
 ExecStart=$REPO_DIR/venv/bin/python3 -m core.main
 Restart=on-failure
 RestartSec=5

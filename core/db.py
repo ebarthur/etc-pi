@@ -145,6 +145,12 @@ CREATE INDEX IF NOT EXISTS idx_vehicles_rfid_uid
 CREATE INDEX IF NOT EXISTS idx_vehicles_plate_number
     ON vehicles (plate_number);
 
+-- created_at below uses strftime(..., 'now') rather than plain datetime('now')
+-- to keep millisecond resolution: has_recent_transaction()'s cooldown check
+-- compares against this column, and datetime('now')'s whole-second truncation
+-- would make even a short/zero cooldown misfire for two passes that land in
+-- the same wall-clock second (a real possibility once ANPR is the path
+-- actually doing the identifying most of the time -- see core/main.py).
 CREATE TABLE IF NOT EXISTS transactions (
     transaction_id          INTEGER PRIMARY KEY AUTOINCREMENT,
     vehicle_id               INTEGER REFERENCES vehicles(vehicle_id),
@@ -160,7 +166,7 @@ CREATE TABLE IF NOT EXISTS transactions (
                                 payment_status IN ('PENDING', 'SUCCESS', 'FAILED')
                               ),
     momo_reference             TEXT,
-    created_at                 TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at                 TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_transactions_vehicle_id
@@ -429,6 +435,27 @@ def get_vehicle_by_plate(plate_number: str) -> Optional[Row]:
             (plate_number,),
         )
         return cursor.fetchone()
+
+
+def has_recent_transaction(vehicle_id: int, within_seconds: float) -> bool:
+    """Whether `vehicle_id` already has a transaction logged in the last
+    `within_seconds`, regardless of its payment outcome.
+
+    Used by core/main.py's _charge_vehicle() to suppress charging the same
+    vehicle twice for what's really one physical pass -- neither
+    identification path (RFID or ANPR) has any other de-duplication.
+    """
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            SELECT 1 FROM transactions
+            WHERE vehicle_id = ?
+              AND created_at >= strftime('%Y-%m-%d %H:%M:%f', 'now', ?)
+            LIMIT 1
+            """,
+            (vehicle_id, f"-{within_seconds} seconds"),
+        )
+        return cursor.fetchone() is not None
 
 
 def log_transaction(

@@ -61,7 +61,10 @@ from typing import List, Optional
 import cv2
 import numpy as np
 
+from anpr.yolov11 import rotate_frame
 from core.config import (
+    ANPR_CAPTURE_RESOLUTION,
+    ANPR_CAPTURE_ROTATION,
     ANPR_DETECTOR_CONFIDENCE,
     ANPR_OCR_MIN_CONFIDENCE,
     PRESENCE_CLEAR_FRAMES,
@@ -73,33 +76,13 @@ from core.config import (
 
 LIVE_RUNS_DIR = Path(__file__).resolve().parent / "live_runs"
 
-# Full-res capture size for anything fed to the models. The IMX708 (Camera
-# Module 3) natively does 4608x2592, but that mode caps at ~14fps and each
-# frame is a large JPEG — too slow and too write-heavy for a roadside burst.
-# 2304x1296 is the sensor's 56fps binned mode: still ~3.6x the linear
-# resolution of the presence stream, which is what actually decides whether a
-# plate is legible at distance.
-CAPTURE_RESOLUTION = (2304, 1296)
-
-# The camera module is physically mounted rotated, so frames land ~90° from
-# upright — the sensor's own metadata does NOT report this (plan.md flags it).
-# Both models were trained on upright plates, so this correction happens
-# before anything reaches them. Verify the direction on real hardware with
-# --calibrate before trusting a run's numbers.
-DEFAULT_ROTATION = 90
-
-_ROTATIONS = {
-    90: cv2.ROTATE_90_CLOCKWISE,
-    180: cv2.ROTATE_180,
-    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
-}
-
-
-def rotate_frame(frame: np.ndarray, degrees: int) -> np.ndarray:
-    """Rotate clockwise by 0/90/180/270 degrees. 0 is a no-op passthrough."""
-    if degrees == 0:
-        return frame
-    return cv2.rotate(frame, _ROTATIONS[degrees])
+# Local aliases: these two now live in core/config.py (ANPR_CAPTURE_*) so
+# sensors/presence.py's real-time capture and this script's roadside data
+# collection share one source of truth — see anpr.yolov11.rotate_frame's
+# docstring. Kept under their original names here since both are part of
+# this module's CLI surface (--rotate's default, run_meta.json's config).
+CAPTURE_RESOLUTION = ANPR_CAPTURE_RESOLUTION
+DEFAULT_ROTATION = ANPR_CAPTURE_ROTATION
 
 
 @dataclass

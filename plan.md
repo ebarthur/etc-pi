@@ -7,6 +7,18 @@ hardware fault is open (RC522 antenna, see below) and blocks RFID from actually 
 anyone right now. Phase 5 (ANPR) stays blocked on trained models; Phases 6-7 (identity
 verification, SMS approval) are explicitly out of scope per this plan's own locked decisions.
 
+Update (2026-08-25): Phase 5 (ANPR) is now wired in — see its section below. The RC522
+antenna fault from 2026-08-15 was never a code problem, so this doesn't fix it, but it does
+mean the orchestrator is no longer dead in the water while that fault is open: every arrival
+that RFID doesn't catch now actually gets read via camera + `anpr/yolov11.py` instead of just
+being logged and dropped. Given that fault, ANPR is — in practice, not in the code's
+structure — carrying most real identifications right now; `core/main.py`'s docstring covers
+why the code still reads RFID-first. Also added in this pass: a per-vehicle repeat-toll
+cooldown (`TOLL_REPEAT_COOLDOWN_SECONDS`, `core/db.py`'s `has_recent_transaction()`) since
+*nothing* previously stopped the same vehicle being charged twice for one lingering pass, and
+env-overridable presence/ANPR tuning knobs so a scaled-down test rig (small RC cars with
+printed plates instead of real vehicles) can be retuned without code changes.
+
 ## Next session — pick up here
 
 1. **RFID antenna fault (blocking)** — `TxControlReg` refuses to enable no matter what's
@@ -35,18 +47,23 @@ verification, SMS approval) are explicitly out of scope per this plan's own lock
 5. Once RFID is physically fixed: re-test the full trigger -> RFID -> charge -> SMS chain
    for real (motion trigger + presence debounce are already verified live; only the RFID
    leg of it is currently blocked by the hardware fault above).
-6. Phase 5 (ANPR) whenever trained `.pt` models exist — `anpr/yolov11.py` is still an empty
-   stub; `sensors/presence.py`'s `capture_fallback_frame()` already saves real frames to
-   `anpr/captures/` today, at 640x480, ~90-degree-rotated from upright (physical mount
-   orientation) — fix the rotation in the capture config as part of that work, not before.
+6. ~~Phase 5 (ANPR) whenever trained `.pt` models exist~~ — **done 2026-08-25**, see Phase 5
+   below. `sensors/presence.py` now runs a two-stream capture (mirroring
+   `anpr/live_test.py`'s `RoadsideCamera`): full-res `ANPR_CAPTURE_RESOLUTION` for the models,
+   rotated upright via the shared `ANPR_CAPTURE_ROTATION`, separate from the still-low-res
+   motion stream.
 
 Everything else that's left needs something only you can provide — see Phase 9 below for
 the fuller per-system breakdown.
 
 ## Context / decisions this plan assumes
 
-- Primary identification = RFID. ANPR is a fallback, **not being built yet** (models not
-  trained). The orchestrator should leave a clean seam for it, not build around it.
+- Primary identification = RFID, structurally: the code checks RFID first because a tag read
+  is unambiguous where a plate read is a probabilistic guess. ANPR (`anpr/yolov11.py`) is
+  wired in as of 2026-08-25 as the fallback on an RFID timeout — see Phase 5. With the RC522
+  antenna fault open (see "Next session" above), it's ANPR that ends up doing most real
+  identifications in practice; that's a hardware-availability fact, not a reason to restructure
+  the code's priority.
 - Payment = Paystack Charge API, mobile_money channel (`api_clients/momo.py`, already written).
 - MoMo charges are often asynchronous (`pending` -> resolved later) — we need a webhook to
   get the final status, not just trust the synchronous response.
@@ -90,10 +107,10 @@ the fuller per-system breakdown.
 
 - [x] Read RFID UID / look up vehicle / compute toll / charge via Paystack / log transaction +
       audit event, all wired up in `core/main.py`.
-- [x] Unknown tag and RFID-timeout (no-tag) cases both log a distinct audit event
-      (`UNKNOWN_RFID_UID`, `RFID_TIMEOUT`) rather than crashing or silently dropping. The
-      ANPR fallback call site is a comment + audit log in `handle_no_tag()`, not a speculative
-      stub function — nothing to call yet.
+- [x] Unknown tag and RFID-timeout (no-tag) cases both log a distinct audit event rather than
+      crashing or silently dropping (`UNKNOWN_RFID_UID`; an RFID timeout now runs the ANPR
+      fallback — see Phase 5, done 2026-08-25 — logging `UNKNOWN_ANPR_PLATE` on an unmatched
+      plate read or `IDENTIFICATION_FAILED` if ANPR found nothing usable either).
 - [x] `pending` Paystack responses leave the transaction as `PENDING` (DB default) rather than
       calling `update_transaction_status` — Phase 3's webhook is what resolves those.
 - [x] Dev-mode `--uid` flag added so this runs without RC522 hardware; the hardware import
@@ -229,26 +246,52 @@ the fuller per-system breakdown.
       takes several minutes of real CPU/RAM — budget for that during Pi setup (Phase 8), it's a
       one-time cost.
 
-## Phase 5 — ANPR (once models exist)
+## Phase 5 — ANPR — DONE (2026-08-25)
 
 **Scope decision, 2026-08-15**: both the plate detector *and* the OCR step will be
 custom-trained `.pt` models supplied by the user — not a generic pretrained OCR engine. The
 original assumption (YOLOv11 detector + `easyocr` for reading the cropped plate) is dropped;
-`easyocr` was removed from `requirements.txt`. `ultralytics` alone covers the detector, and
-covers the OCR model too if it also turns out to be YOLO-format — not yet confirmed. If the OCR
-model turns out to be a non-YOLO custom architecture instead, add `torch`/`torchvision`
-explicitly at that point (not before — avoids installing a second ML framework's weight until
-it's known to be needed).
+`easyocr` was removed from `requirements.txt`. `ultralytics` alone covers the detector; the OCR
+model turned out to be PARSeq (PyTorch Lightning checkpoint, not YOLO-format) — see
+`anpr/parseq_infer.py` and this skill's `.claude/skills/restore-smart-toll` notes on the
+2026-08-19 model inspection.
 
-- [ ] `anpr/yolov11.py`: load the trained `.pt` (YOLOv11 plate detector) via `ultralytics`,
-      crop plate region, feed to the OCR model (loading mechanism TBD — see scope decision
-      above, pending which model format the OCR `.pt` turns out to be).
-- [ ] Wire into `core/main.py`'s existing fallback seam from Phase 1 — triggered when RFID
-      read times out.
-- [ ] Confidence threshold below which we don't trust the plate match (config value, tune
-      later against real data).
-- [ ] Captured frames go to `anpr/captures/` (already gitignored) — decide a retention/cleanup
-      policy so this doesn't slowly fill the SD card.
+- [x] `anpr/yolov11.py`: `ANPRPipeline` loads the trained YOLOv11n detector (`crop.pt`) via
+      `ultralytics` and the PARSeq OCR checkpoint (`ocr.ckpt`) via `anpr/parseq_infer.py`,
+      crops each detection, batches the OCR pass. `PlateRead.confidence` combines both models'
+      scores; `best_plate()` gates on `ANPR_OCR_MIN_CONFIDENCE` and rejects empty reads.
+- [x] Wired into `core/main.py`'s fallback seam from Phase 1: `run_hardware_loop()` captures a
+      full-res frame off `sensors.presence.PresenceSensor.capture_frame()` on an RFID timeout,
+      runs it through `ANPRPipeline.best_plate()`, and hands a hit to the new `handle_plate()`
+      (parallel to `handle_uid()`, both routed through a shared `_charge_vehicle()` so the
+      charge/notify/log/cooldown logic can't drift between the two paths). A genuine miss on
+      both RFID and ANPR now logs `IDENTIFICATION_FAILED` (was `RFID_TIMEOUT`).
+- [x] `ANPR_DETECTOR_CONFIDENCE` / `ANPR_OCR_MIN_CONFIDENCE` (`core/config.py`) — both
+      env-overridable now (`ANPR_DETECTOR_CONFIDENCE`, `ANPR_OCR_MIN_CONFIDENCE`) since a
+      printed miniature test-rig plate is expected to need different thresholds than whatever
+      the real-vehicle models were trained/validated against.
+- [x] Captured frames still go to `anpr/captures/` (gitignored) — retention/cleanup policy
+      remains an open TODO, not addressed in this pass.
+- [x] The known ~90-degree capture rotation is now corrected before frames reach either model
+      (`sensors/presence.py`'s `capture_frame()`, `ANPR_CAPTURE_ROTATION` in `core/config.py`,
+      `anpr.yolov11.rotate_frame()` shared with `anpr/live_test.py`) — re-run
+      `python3 -m anpr.live_test --calibrate` and update `ANPR_CAPTURE_ROTATION` if the camera
+      is ever remounted differently.
+- [x] New in this pass, not originally scoped here but exposed by wiring ANPR in as the
+      fallback that's functionally primary: neither RFID nor ANPR previously had *any*
+      protection against charging the same vehicle twice for one lingering pass (a real risk
+      once a vehicle can be re-identified by camera alone, and an even more immediate one on a
+      test rig where the same RC car laps past the gate repeatedly). Added
+      `TOLL_REPEAT_COOLDOWN_SECONDS` (`core/config.py`, default 60s, env-overridable) and
+      `core/db.py`'s `has_recent_transaction()` — `core/main.py`'s `_charge_vehicle()` checks
+      it before every charge and logs `DUPLICATE_TOLL_SKIPPED` rather than charging again.
+      Needed millisecond-resolution `created_at` (`strftime(...,'now')` instead of
+      `datetime('now')`) so a short/zero cooldown doesn't misfire on two passes landing in the
+      same wall-clock second.
+- [ ] Still open: retention/cleanup policy for `anpr/captures/`; real-world confidence-
+      threshold tuning against actual roadside (or rig) data via `anpr/live_test.py`; PARSeq's
+      trained accuracy is still low (`val_accuracy ~23.8%`) so expect a real miss rate until/
+      unless the model gets more training.
 
 ## Phase 6 — Identity verification (deferred, out of scope for now)
 

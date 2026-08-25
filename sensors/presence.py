@@ -1,28 +1,32 @@
 """
 sensors/presence.py
 
-Camera-based vehicle-presence trigger for the Smart Toll orchestrator.
+Camera-based vehicle-presence trigger for the Smart Toll orchestrator, and
+the frame source for ANPR (anpr/yolov11.py) once RFID's window times out.
 
 No dedicated presence sensor (IR break-beam, ultrasonic, inductive loop) is
-available yet, so this reuses the camera already wired up for the future
-ANPR fallback (see anpr/yolov11.py, plan.md Phase 5): it grabs a low-res
-frame on a short poll interval and flags "vehicle arrived" once the mean
-absolute pixel difference between consecutive frames stays above
-PRESENCE_MOTION_THRESHOLD for PRESENCE_SUSTAIN_FRAMES in a row (debounces a
-single noisy frame from a real approach). See core/config.py for how the
-threshold was picked -- from a real measured noise floor on this hardware,
-not guessed.
+available yet, so this runs a two-stream camera config (mirroring
+anpr/live_test.py's RoadsideCamera): a cheap "lores" stream it polls for
+motion, and a full-res "main" stream it only reads from on demand. A vehicle
+is flagged "arrived" once the mean absolute luma difference between
+consecutive lores frames stays above PRESENCE_MOTION_THRESHOLD for
+PRESENCE_SUSTAIN_FRAMES in a row (debounces a single noisy frame from a real
+approach). See core/config.py for how the threshold was picked -- from a
+real measured noise floor on this hardware, not guessed -- and note it was
+measured against a full-size vehicle at roadside distance, so it's worth
+re-checking against the real noise floor before trusting it on a scaled-down
+rig where the subject fills much less of the frame.
 
-The interface (wait_for_vehicle / wait_until_clear) is deliberately
-hardware-agnostic so core/main.py wouldn't need to change if this is ever
-swapped out for a real presence sensor.
+The interface (wait_for_vehicle / wait_until_clear / capture_frame) is
+deliberately hardware-agnostic so core/main.py wouldn't need to change if
+this is ever swapped out for a real presence sensor plus a separate camera.
 
 Usage (from core/main.py):
     from sensors.presence import PresenceSensor
 
     presence = PresenceSensor()
     presence.wait_for_vehicle()   # blocks until motion is detected
-    ...                            # RFID window / ANPR fallback here
+    ...                            # RFID window, then ANPR on capture_frame()
     presence.wait_until_clear()   # blocks until motion settles back down
     presence.cleanup()
 """
@@ -31,10 +35,14 @@ import time
 from pathlib import Path
 from typing import Union
 
+import cv2
 import numpy as np
 from picamera2 import Picamera2
 
+from anpr.yolov11 import rotate_frame
 from core.config import (
+    ANPR_CAPTURE_RESOLUTION,
+    ANPR_CAPTURE_ROTATION,
     PRESENCE_CLEAR_FRAMES,
     PRESENCE_MOTION_THRESHOLD,
     PRESENCE_POLL_INTERVAL_SECONDS,
@@ -49,7 +57,8 @@ class PresenceSensor:
     def __init__(self) -> None:
         self._picam2 = Picamera2()
         config = self._picam2.create_video_configuration(
-            main={"size": PRESENCE_RESOLUTION, "format": "RGB888"}
+            main={"size": ANPR_CAPTURE_RESOLUTION, "format": "RGB888"},
+            lores={"size": PRESENCE_RESOLUTION, "format": "YUV420"},
         )
         self._picam2.configure(config)
         self._picam2.start()
@@ -58,15 +67,21 @@ class PresenceSensor:
         # whatever comes right after it (confirmed during manual capture
         # testing earlier this session).
         time.sleep(1.0)
-        self._last_frame = self._grayscale_frame()
+        self._last_frame = self._lores_luma()
 
-    def _grayscale_frame(self) -> np.ndarray:
-        frame = self._picam2.capture_array()
-        return frame.mean(axis=2)  # cheap grayscale: average the RGB channels
+    def _lores_luma(self) -> np.ndarray:
+        """Grayscale (Y-plane) frame from the cheap lores stream.
+
+        YUV420's first HxW bytes are the Y (luma) plane -- already
+        grayscale, so no colour conversion or channel averaging needed.
+        """
+        frame = self._picam2.capture_array("lores")
+        width, height = PRESENCE_RESOLUTION
+        return frame[:height, :width].astype(np.int16)
 
     def _frame_diff(self) -> float:
-        frame = self._grayscale_frame()
-        diff = float(np.abs(frame.astype(np.int16) - self._last_frame.astype(np.int16)).mean())
+        frame = self._lores_luma()
+        diff = float(np.abs(frame - self._last_frame).mean())
         self._last_frame = frame
         return diff
 
@@ -90,16 +105,20 @@ class PresenceSensor:
             streak = streak + 1 if diff < PRESENCE_MOTION_THRESHOLD else 0
             time.sleep(PRESENCE_POLL_INTERVAL_SECONDS)
 
-    def capture_fallback_frame(self, path: Union[str, Path]) -> None:
-        """Save a still for ANPR to consume, once anpr/yolov11.py exists.
+    def capture_frame(self) -> np.ndarray:
+        """One full-res BGR frame from the "main" stream, rotated upright and
+        ready for anpr.yolov11.ANPRPipeline.
 
-        Saved at PRESENCE_RESOLUTION (640x480), not full sensor resolution --
-        fine for now since there's no model to feed it yet. Revisit
-        resolution/stream config (e.g. a second full-res "main" stream
-        alongside this "lores" one) together with the known ~90-degree
-        capture rotation (see plan.md) once Phase 5 actually starts.
+        picamera2's "RGB888" format actually hands back channels in BGR
+        order, which is what OpenCV and both ANPR models' preprocessing
+        already expect -- so no colour conversion happens here, deliberately
+        (matches anpr/live_test.py's RoadsideCamera.capture_frame()).
         """
-        self._picam2.capture_file(str(path))
+        return rotate_frame(self._picam2.capture_array("main"), ANPR_CAPTURE_ROTATION)
+
+    def capture_fallback_frame(self, path: Union[str, Path]) -> None:
+        """Save capture_frame()'s output to disk, e.g. for audit/debugging."""
+        cv2.imwrite(str(path), self.capture_frame())
 
     def cleanup(self) -> None:
         self._picam2.stop()

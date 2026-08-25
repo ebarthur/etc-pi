@@ -12,7 +12,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-RFID_TIMEOUT_SECONDS = 2.0
+# Overridable via env: the RC522's real-world read range on this hardware
+# is well under a vehicle's approach distance, so this window mostly just
+# bounds how long ANPR waits its turn behind RFID at each arrival, not how
+# long a tag actually gets to be read. Shorten it for a rig where a
+# presence-triggered pass is over quickly (e.g. a miniature RC-car test
+# track) so ANPR gets to run sooner.
+RFID_TIMEOUT_SECONDS = float(os.environ.get("RFID_TIMEOUT_SECONDS") or "2.0")
 
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "")
 PAYSTACK_BASE_URL = "https://api.paystack.co"
@@ -67,30 +73,74 @@ ANPR_CAPTURE_DIR = _ANPR_DIR / "captures"
 # on. Deliberately low — the detector is single-class (plate/not-plate) and
 # the OCR step has its own confidence gate below, so a permissive detector
 # threshold costs little and avoids dropping small/distant plates outright.
-ANPR_DETECTOR_CONFIDENCE = 0.25
+# Overridable via env — expect to retune this against a printed miniature
+# plate, which the detector never saw in training.
+ANPR_DETECTOR_CONFIDENCE = float(os.environ.get("ANPR_DETECTOR_CONFIDENCE") or "0.25")
 # Minimum mean per-character OCR confidence before a plate read is treated as
 # usable rather than a guess. The trained checkpoint reports val_accuracy
 # ~23.8% (epoch 43-45), so a large share of reads will legitimately fall
 # below this — that's the model's current quality, not a bug in the gate.
-ANPR_OCR_MIN_CONFIDENCE = 0.5
+# Overridable via env for the same reason as the detector threshold above.
+ANPR_OCR_MIN_CONFIDENCE = float(os.environ.get("ANPR_OCR_MIN_CONFIDENCE") or "0.5")
+
+# Full-res capture used for ANPR (sensors/presence.py's "main" stream and
+# anpr/live_test.py's RoadsideCamera) — separate from PRESENCE_RESOLUTION
+# below, which is deliberately low-res and only good for motion detection.
+# The IMX708 natively does 4608x2592, but that mode caps at ~14fps; 2304x1296
+# is the sensor's 56fps binned mode. Overridable via env — a miniature rig
+# with the camera mounted close to a small printed plate may read fine at a
+# smaller/cheaper resolution than a roadside setup needs.
+ANPR_CAPTURE_RESOLUTION = (
+    int(os.environ.get("ANPR_CAPTURE_WIDTH") or "2304"),
+    int(os.environ.get("ANPR_CAPTURE_HEIGHT") or "1296"),
+)
+# The camera module is physically mounted rotated, so frames land ~90 degrees
+# from upright and the sensor's own metadata doesn't report it — both models
+# were trained on upright plates. Confirmed via `python3 -m anpr.live_test
+# --calibrate`; re-run that after remounting the camera on a different rig.
+ANPR_CAPTURE_ROTATION = int(os.environ.get("ANPR_CAPTURE_ROTATION") or "90")
 
 # --- Vehicle presence (sensors/presence.py) ---
 # No dedicated presence sensor (IR break-beam, ultrasonic, inductive loop) is
-# available yet, so the camera doubles as the trigger via frame-differencing.
-# Threshold/sustain values below were picked from a real empirical baseline on
-# this hardware, 2026-08-15: 20 consecutive frames of a static scene at
-# (640, 480) measured a mean-abs-pixel-diff noise floor of ~2.2-3.3 (0-255
-# scale) between consecutive frames. PRESENCE_MOTION_THRESHOLD sits well above
-# that (~3x the observed max), not guessed blind. Re-tune in the field once a
-# real vehicle approach is observable, and swap this whole module out for
-# real presence hardware if/when one is available.
-PRESENCE_RESOLUTION = (640, 480)
-PRESENCE_MOTION_THRESHOLD = 10.0
-PRESENCE_POLL_INTERVAL_SECONDS = 0.15
+# available yet, so the camera doubles as the trigger via frame-differencing,
+# on a cheap "lores" stream separate from the full-res "main" stream ANPR
+# reads (see ANPR_CAPTURE_RESOLUTION above). Threshold/sustain values below
+# were picked from a real empirical baseline on this hardware, 2026-08-15: 20
+# consecutive frames of a static scene at (640, 480) measured a mean-abs-
+# pixel-diff noise floor of ~2.2-3.3 (0-255 scale) between consecutive
+# frames. PRESENCE_MOTION_THRESHOLD sits well above that (~3x the observed
+# max), not guessed blind.
+#
+# All of these are env-overridable specifically so a miniature rig (a small
+# RC car instead of a real vehicle, camera mounted close) can be retuned
+# without touching code — a small subject fills much less of the frame than
+# a real vehicle at roadside distance, so the noise-floor baseline above
+# doesn't necessarily transfer; re-measure it for the actual rig geometry
+# before trusting the default threshold. Swap this whole module out for real
+# presence hardware if/when one is available.
+PRESENCE_RESOLUTION = (
+    int(os.environ.get("PRESENCE_WIDTH") or "640"),
+    int(os.environ.get("PRESENCE_HEIGHT") or "480"),
+)
+PRESENCE_MOTION_THRESHOLD = float(os.environ.get("PRESENCE_MOTION_THRESHOLD") or "10.0")
+PRESENCE_POLL_INTERVAL_SECONDS = float(os.environ.get("PRESENCE_POLL_INTERVAL_SECONDS") or "0.15")
 # Consecutive above-threshold frames required before treating it as a real
 # vehicle arrival rather than single-frame noise/a glitch.
-PRESENCE_SUSTAIN_FRAMES = 3
+PRESENCE_SUSTAIN_FRAMES = int(os.environ.get("PRESENCE_SUSTAIN_FRAMES") or "3")
 # Consecutive below-threshold frames required before re-arming, so a vehicle
 # that's still sitting in frame (e.g. mid-charge) doesn't immediately
 # retrigger a second detection.
-PRESENCE_CLEAR_FRAMES = 5
+PRESENCE_CLEAR_FRAMES = int(os.environ.get("PRESENCE_CLEAR_FRAMES") or "5")
+
+# --- Repeat-toll cooldown ---
+# Neither identification path (RFID or ANPR) has ever had any de-duplication
+# — every confirmed arrival charges, unconditionally. That's a real gap once
+# ANPR is the path actually doing the identifying most of the time (see
+# core/main.py): a vehicle that lingers across two arrival events, or, on a
+# scaled-down test rig, laps the same RC car past the gate repeatedly in a
+# short run, would otherwise be billed once per pass instead of once per
+# real toll event. Any transaction already logged for a vehicle within this
+# window suppresses a new charge — see core/db.py's has_recent_transaction()
+# and core/main.py's _charge_vehicle(). Shorten this for rig testing if you
+# deliberately want to re-pass the same vehicle sooner than the default.
+TOLL_REPEAT_COOLDOWN_SECONDS = float(os.environ.get("TOLL_REPEAT_COOLDOWN_SECONDS") or "60")
