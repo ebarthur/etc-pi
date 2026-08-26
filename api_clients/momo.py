@@ -1,109 +1,131 @@
 """
 api_clients/momo.py
 
-Mobile money charge client, using Paystack's Charge API (mobile_money
-channel) to simulate an MTN MoMo toll deduction.
+Paystack hosted-checkout client. Initializes a transaction and hands back a
+checkout link (authorization_url) for the vehicle owner to pay through on
+their own time/device, via whichever channel they pick on Paystack's page --
+this project no longer picks a mobile money provider and charges directly
+(see git history for the old /charge-based charge_toll(), replaced because
+a live account's mobile money charges require an OTP step this codebase
+never handled, and because there's no webhook access on this account to
+resolve an async result anyway). Resolution now happens out-of-band, by
+workers/charge's cron job polling Paystack's verify endpoint.
 
 Paystack requires amounts in the currency's lowest denomination (pesewas
 for GHS), so all amounts are converted from GHS floats before the request.
+Per Paystack's own /transaction/initialize docs, `amount` is a String (not
+a bare number) and `metadata` must be a JSON-stringified string, not a raw
+object -- both confirmed against the official doc text, not just examples.
 """
 
+import json
+import logging
 import requests
 from typing import Optional, TypedDict
 
 from core.config import PAYSTACK_SECRET_KEY, PAYSTACK_BASE_URL
 
-# Paystack's supported mobile money provider codes for Ghana.
-MOMO_PROVIDER_MAP = {
-    "mtn": "mtn",
-    "vodafone": "vod",   # Telecel Cash, legacy Paystack code
-    "airteltigo": "atl",
-}
-DEFAULT_PROVIDER = "mtn"
+logger = logging.getLogger(__name__)
 
 
-class ChargeResult(TypedDict):
+class InitializeResult(TypedDict):
     success: bool
+    authorization_url: Optional[str]
     reference: Optional[str]
-    status: str          # e.g. 'success', 'pending', 'failed'
     message: str
 
 
-def charge_toll(
+def initialize_transaction(
     phone_number: str,
     amount_ghs: float,
-    provider: str = DEFAULT_PROVIDER,
-) -> ChargeResult:
-    """Initiate a mobile money toll deduction via Paystack.
+    vehicle_id: Optional[int] = None,
+) -> InitializeResult:
+    """Start a Paystack hosted-checkout transaction and return its link.
 
     Args:
-        phone_number: Owner's mobile money number, from ghana_card.py's
-            OwnerRecord.
+        phone_number: Owner's number -- used only for the placeholder email
+            Paystack requires (see below) and stashed in metadata for
+            cross-reference; the owner enters their own payment details on
+            Paystack's page, so this is never sent as a payment channel.
         amount_ghs: Toll amount in Ghana Cedis (whole currency, not pesewas).
-        provider: One of MOMO_PROVIDER_MAP keys. Defaults to MTN.
+        vehicle_id: Stashed in metadata for cross-reference against the
+            local DB from Paystack's dashboard/API if ever needed.
 
     Returns:
-        ChargeResult with the outcome. Callers should treat 'pending' as
-        not-yet-final — Paystack mobile money charges are often
-        asynchronous and may require a webhook or status poll to confirm.
+        InitializeResult. Callers store `reference` (core.db's
+        set_transaction_reference) so workers/charge's cron polling can
+        later resolve this to SUCCESS/FAILED via Paystack's verify endpoint
+        -- nothing here is a final outcome.
     """
     if not PAYSTACK_SECRET_KEY:
-        return ChargeResult(
+        return InitializeResult(
             success=False,
+            authorization_url=None,
             reference=None,
-            status="failed",
             message="PAYSTACK_SECRET_KEY not set in environment",
         )
 
-    provider_code = MOMO_PROVIDER_MAP.get(provider, MOMO_PROVIDER_MAP[DEFAULT_PROVIDER])
     amount_pesewas = int(round(amount_ghs * 100))
 
     payload = {
         # Paystack requires an email field but never delivers to it for a
-        # mobile money charge. Must not use a reserved special-use TLD
+        # mobile money owner. Must not use a reserved special-use TLD
         # (.local/.test/.invalid/etc, RFC 2606/6761/6762) — confirmed
         # empirically Paystack's validator rejects those specifically with
         # "Invalid Email Address Passed" regardless of the rest of the
         # address; it does not check whether the domain actually resolves,
         # so any ordinary public TLD works even if unregistered.
         "email": f"{phone_number}@smarttoll.com",
-        "amount": amount_pesewas,
+        # Docs specify amount as a String, not a bare number.
+        "amount": str(amount_pesewas),
         "currency": "GHS",
-        "mobile_money": {
-            "phone": phone_number,
-            "provider": provider_code,
-        },
+        # Docs specify metadata as a stringified JSON object, not a raw one.
+        "metadata": json.dumps({"vehicle_id": vehicle_id, "phone_number": phone_number}),
     }
     headers = {
         "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
         "Content-Type": "application/json",
     }
 
+    logger.debug(
+        "HTTP request: POST %s headers=%s body=%s",
+        f"{PAYSTACK_BASE_URL}/transaction/initialize",
+        {**headers, "Authorization": "Bearer ***redacted***"},
+        payload,
+    )
     try:
         response = requests.post(
-            f"{PAYSTACK_BASE_URL}/charge",
+            f"{PAYSTACK_BASE_URL}/transaction/initialize",
             json=payload,
             headers=headers,
             timeout=10,
         )
+        logger.debug(
+            "HTTP response: %s %s headers=%s body=%s",
+            response.status_code, response.reason, dict(response.headers), response.text,
+        )
         data = response.json()
     except requests.RequestException as e:
-        return ChargeResult(
-            success=False, reference=None, status="failed", message=str(e)
+        logger.warning("Paystack initialize request failed: %s", e)
+        return InitializeResult(
+            success=False, authorization_url=None, reference=None, message=str(e)
         )
 
     if not data.get("status"):
-        return ChargeResult(
+        logger.warning("Paystack initialize rejected: %s", data.get("message", "Unknown Paystack error"))
+        return InitializeResult(
             success=False,
+            authorization_url=None,
             reference=None,
-            status="failed",
             message=data.get("message", "Unknown Paystack error"),
         )
 
-    charge_data = data.get("data", {})
-    return ChargeResult(
-        success=charge_data.get("status") == "success",
-        reference=charge_data.get("reference"),
-        status=charge_data.get("status", "unknown"),
+    init_data = data.get("data", {})
+    result = InitializeResult(
+        success=True,
+        authorization_url=init_data.get("authorization_url"),
+        reference=init_data.get("reference"),
         message=data.get("message", ""),
     )
+    logger.debug("Paystack initialize result: %s", result)
+    return result

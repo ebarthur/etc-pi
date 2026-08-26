@@ -135,6 +135,11 @@ class PlateDetector:
                 )
 
         detections.sort(key=lambda d: d.confidence, reverse=True)
+        logger.debug(
+            "Detector: %d region(s) >= %.2f confidence -- %s",
+            len(detections), self.confidence,
+            [round(d.confidence, 2) for d in detections],
+        )
         return detections
 
 
@@ -231,7 +236,7 @@ class ANPRPipeline:
         # than a call each.
         ocr_results = self._ensure_ocr().read_batch(crops)
 
-        return [
+        reads = [
             PlateRead(
                 text=text,
                 ocr_confidence=ocr_confidence,
@@ -240,6 +245,12 @@ class ANPRPipeline:
             )
             for detection, (text, ocr_confidence) in zip(kept, ocr_results)
         ]
+        for read in reads:
+            logger.debug(
+                "OCR: text=%r ocr_confidence=%.2f detector_confidence=%.2f combined=%.2f",
+                read.text, read.ocr_confidence, read.detector_confidence, read.confidence,
+            )
+        return reads
 
     def best_plate(
         self, frame: np.ndarray, min_ocr_confidence: float = ANPR_OCR_MIN_CONFIDENCE
@@ -257,5 +268,8 @@ class ANPRPipeline:
             if plate.text and plate.ocr_confidence >= min_ocr_confidence
         ]
         if not candidates:
+            logger.debug("best_plate: no read >= min_ocr_confidence=%.2f", min_ocr_confidence)
             return None
-        return max(candidates, key=lambda p: p.confidence)
+        best = max(candidates, key=lambda p: p.confidence)
+        logger.info("best_plate: text=%r confidence=%.2f", best.text, best.confidence)
+        return best

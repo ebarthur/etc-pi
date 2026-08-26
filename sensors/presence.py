@@ -21,6 +21,14 @@ The interface (wait_for_vehicle / wait_until_clear / capture_frame) is
 deliberately hardware-agnostic so core/main.py wouldn't need to change if
 this is ever swapped out for a real presence sensor plus a separate camera.
 
+All `self._picam2.capture_array(...)` calls go through `self._lock`: in
+dev mode, core/dev_stream.py's MJPEG preview thread calls capture_frame()
+concurrently with this class's own main-loop thread (wait_for_vehicle's
+lores polling, wait_until_clear, and the RFID-timeout capture_frame() call)
+-- Picamera2 doesn't document concurrent capture_array() calls from
+multiple threads as safe, so this serializes them rather than assuming it
+works.
+
 Usage (from core/main.py):
     from sensors.presence import PresenceSensor
 
@@ -31,6 +39,8 @@ Usage (from core/main.py):
     presence.cleanup()
 """
 
+import logging
+import threading
 import time
 from pathlib import Path
 from typing import Union
@@ -50,11 +60,14 @@ from core.config import (
     PRESENCE_SUSTAIN_FRAMES,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class PresenceSensor:
     """Frame-differencing motion trigger, standing in for dedicated presence hardware."""
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._picam2 = Picamera2()
         config = self._picam2.create_video_configuration(
             main={"size": ANPR_CAPTURE_RESOLUTION, "format": "RGB888"},
@@ -75,7 +88,8 @@ class PresenceSensor:
         YUV420's first HxW bytes are the Y (luma) plane -- already
         grayscale, so no colour conversion or channel averaging needed.
         """
-        frame = self._picam2.capture_array("lores")
+        with self._lock:
+            frame = self._picam2.capture_array("lores")
         width, height = PRESENCE_RESOLUTION
         return frame[:height, :width].astype(np.int16)
 
@@ -90,8 +104,15 @@ class PresenceSensor:
         streak = 0
         while streak < PRESENCE_SUSTAIN_FRAMES:
             diff = self._frame_diff()
-            streak = streak + 1 if diff >= PRESENCE_MOTION_THRESHOLD else 0
+            if diff >= PRESENCE_MOTION_THRESHOLD:
+                streak += 1
+                logger.debug("motion diff=%.2f >= threshold=%.2f, streak=%d/%d", diff, PRESENCE_MOTION_THRESHOLD, streak, PRESENCE_SUSTAIN_FRAMES)
+            else:
+                if streak:
+                    logger.debug("motion diff=%.2f below threshold, streak reset", diff)
+                streak = 0
             time.sleep(PRESENCE_POLL_INTERVAL_SECONDS)
+        logger.info("Vehicle arrival: motion sustained for %d frames", PRESENCE_SUSTAIN_FRAMES)
 
     def wait_until_clear(self) -> None:
         """Block until motion drops below threshold for PRESENCE_CLEAR_FRAMES in a row.
@@ -102,8 +123,15 @@ class PresenceSensor:
         streak = 0
         while streak < PRESENCE_CLEAR_FRAMES:
             diff = self._frame_diff()
-            streak = streak + 1 if diff < PRESENCE_MOTION_THRESHOLD else 0
+            if diff < PRESENCE_MOTION_THRESHOLD:
+                streak += 1
+                logger.debug("motion diff=%.2f < threshold, clear streak=%d/%d", diff, streak, PRESENCE_CLEAR_FRAMES)
+            else:
+                if streak:
+                    logger.debug("motion diff=%.2f still above threshold, clear streak reset", diff)
+                streak = 0
             time.sleep(PRESENCE_POLL_INTERVAL_SECONDS)
+        logger.info("Scene clear -- re-armed for next arrival")
 
     def capture_frame(self) -> np.ndarray:
         """One full-res BGR frame from the "main" stream, rotated upright and
@@ -114,11 +142,17 @@ class PresenceSensor:
         already expect -- so no colour conversion happens here, deliberately
         (matches anpr/live_test.py's RoadsideCamera.capture_frame()).
         """
-        return rotate_frame(self._picam2.capture_array("main"), ANPR_CAPTURE_ROTATION)
+        with self._lock:
+            raw = self._picam2.capture_array("main")
+        frame = rotate_frame(raw, ANPR_CAPTURE_ROTATION)
+        logger.debug("Captured full-res frame from 'main' stream: shape=%s", frame.shape)
+        return frame
 
     def capture_fallback_frame(self, path: Union[str, Path]) -> None:
         """Save capture_frame()'s output to disk, e.g. for audit/debugging."""
-        cv2.imwrite(str(path), self.capture_frame())
+        frame = self.capture_frame()
+        cv2.imwrite(str(path), frame)
+        logger.debug("Saved fallback frame to %s", path)
 
     def cleanup(self) -> None:
         self._picam2.stop()

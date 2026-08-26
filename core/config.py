@@ -41,12 +41,13 @@ ARKESEL_SENDER_ID = os.environ.get("ARKESEL_SENDER_ID", "SmartToll")
 TOLL_GATE_NAME = os.environ.get("TOLL_GATE_NAME", "the N1 Highway Toll Point")
 
 # --- Toll rates (GHS) by vehicle type ---
-# Prototype values — adjust to match your Chapter 3 methodology figures.
+# Prototype values — adjust to match your Chapter 3 methodology figures. Scaled to a max of
+# 1.50 (2026-08-26, was 15.00) for live testing against real Paystack/Arkesel accounts.
 TOLL_RATES = {
-    "car": 5.00,
-    "suv": 8.00,
-    "bus": 10.00,
-    "truck": 15.00,
+    "car": 0.50,
+    "suv": 0.80,
+    "bus": 1.00,
+    "truck": 1.50,
 }
 
 DEFAULT_TOLL_RATE = TOLL_RATES["car"]
@@ -131,6 +132,30 @@ PRESENCE_SUSTAIN_FRAMES = int(os.environ.get("PRESENCE_SUSTAIN_FRAMES") or "3")
 # that's still sitting in frame (e.g. mid-charge) doesn't immediately
 # retrigger a second detection.
 PRESENCE_CLEAR_FRAMES = int(os.environ.get("PRESENCE_CLEAR_FRAMES") or "5")
+
+# --- Dev-mode verbose logging (core/dev_log.py) ---
+# Off by default -- a real/production run should stay quiet, and this is
+# stdout-only regardless of this flag (never a FileHandler): this Pi's SD
+# card has already shown real corruption (plan.md Phase 0), so dev-mode
+# verbosity must add console noise, not write volume. Turn on for a field-
+# test session to trace every stage: presence/motion, ANPR detection+OCR, DB
+# lookups/writes, SMS/charge calls. `python3 -m core.main --dev` enables this
+# for one run without touching the environment.
+DEV_MODE = os.environ.get("DEV_MODE", "").strip().lower() in ("1", "true", "yes", "on")
+
+# --- Dev-mode camera preview stream (core/dev_stream.py) ---
+# Full-res ANPR frame (the same frame sensors.presence.PresenceSensor hands
+# to anpr.yolov11.ANPRPipeline) served as MJPEG over HTTP, gated by DEV_MODE
+# above -- since Picamera2 only lets one process hold the camera at a time,
+# this is what lets you actually watch what the camera/ANPR pipeline sees
+# live during a field-test session, from a browser, without a second
+# process fighting the running one for the camera.
+DEV_STREAM_PORT = int(os.environ.get("DEV_STREAM_PORT") or "8000")
+# Deliberately low: this Pi's CPU is already busy with presence detection
+# and, on an RFID timeout, the ANPR models -- encoding/serving full-res
+# JPEGs faster than this risks starving those. Override via env if a given
+# rig has CPU headroom to spare.
+DEV_STREAM_FPS = float(os.environ.get("DEV_STREAM_FPS") or "3.0")
 
 # --- Repeat-toll cooldown ---
 # Neither identification path (RFID or ANPR) has ever had any de-duplication

@@ -19,6 +19,24 @@ cooldown (`TOLL_REPEAT_COOLDOWN_SECONDS`, `core/db.py`'s `has_recent_transaction
 env-overridable presence/ANPR tuning knobs so a scaled-down test rig (small RC cars with
 printed plates instead of real vehicles) can be retuned without code changes.
 
+Update (2026-08-26): Phase 3's direct-charge design is replaced — see "Phase 3" below,
+superseded, not deleted. Live-testing against a real (not sandbox) Paystack account this
+session surfaced two problems: a live mobile money charge (`POST /charge`) comes back
+`status: "send_otp"`, requiring a customer-side OTP step this codebase never handled, so the
+transaction was getting mislabeled `FAILED` when it was really just stuck; and this account
+has no webhook access, so `workers/charge`'s webhook receiver could never resolve anything
+regardless. Fix: `api_clients/momo.py`'s `initialize_transaction()` now creates a Paystack
+hosted-checkout link (`POST /transaction/initialize`) instead of charging directly;
+`core/main.py` SMSes that link to the owner to pay on their own time/device/channel
+(`api_clients/arkesel.py`'s `send_payment_link_sms()`, replacing the old pre-charge
+notification); and `workers/charge` is now a Cloudflare Cron Trigger (every minute, not an
+HTTP route) that polls Paystack's verify endpoint for every `PENDING` transaction and
+resolves it directly against Turso — one automatic link reissue on failure/abandonment, then
+terminal `FAILED`; a reminder SMS (same link) if still genuinely pending after 2 hours.
+`core/db.py`'s `transactions` table gained `checkout_url`/`link_issued_at`/
+`reminder_sent_at`/`reissue_count` via a new idempotent migration step in `init_db()` (the
+first schema change after real data already existed locally and in Turso).
+
 ## Next session — pick up here
 
 1. **RFID antenna fault (blocking)** — `TxControlReg` refuses to enable no matter what's
@@ -143,7 +161,13 @@ the fuller per-system breakdown.
 - [x] Ran the suite locally: `python3 -m pytest tests/test_rfid.py tests/test_integration.py -v`
       — 9 passed.
 
-## Phase 3 — Paystack webhook (`workers/charge`) — DONE
+## Phase 3 — Paystack webhook (`workers/charge`) — SUPERSEDED (2026-08-26)
+
+**See the 2026-08-26 update above.** `workers/charge` no longer receives a webhook at all —
+this account has no webhook access, and a live mobile money charge needs a customer-side OTP
+step this design never handled. It's now a Cron Trigger polling Paystack's verify endpoint
+instead. Left below as a historical record of the original (working, in sandbox) design, not
+because any of it still runs.
 
 - [x] Cloudflare Worker (`workers/charge/src/index.ts`) receives Paystack's webhook POST,
       verifies `x-paystack-signature` (HMAC-SHA512 of the *raw* request body, keyed with

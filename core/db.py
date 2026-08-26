@@ -23,6 +23,7 @@ concurrently, and WAL avoids the "database is locked" errors that
 Pi-class SD card I/O can otherwise trigger under the default journal mode.
 """
 
+import logging
 import sqlite3
 import sys
 import threading
@@ -34,6 +35,8 @@ from typing import Any, Iterator, Optional, Sequence
 import libsql
 
 from core.config import TOLL_RATES, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL, TURSO_SYNC_INTERVAL_SECONDS
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).resolve().parent.parent / "db" / "tolling.db"
 
@@ -166,6 +169,19 @@ CREATE TABLE IF NOT EXISTS transactions (
                                 payment_status IN ('PENDING', 'SUCCESS', 'FAILED')
                               ),
     momo_reference             TEXT,
+    -- checkout_url is Paystack's authorization_url for momo_reference -- stored separately
+    -- because it can't be reconstructed from the reference alone (they're independent
+    -- values in Paystack's response, not derived from each other), and workers/charge's
+    -- reminder SMS needs to resend the *same* link, not just know a reference exists.
+    checkout_url               TEXT,
+    -- link_issued_at is when the *current* checkout link (momo_reference/checkout_url) was
+    -- actually sent -- separate from created_at, so a reissued link (workers/charge's cron)
+    -- gets its own fresh 2-hour reminder window instead of the reminder firing immediately
+    -- because created_at is already old. reminder_sent_at/reissue_count are also keyed to
+    -- the current link: both reset when a link is reissued (see workers/charge/src/index.ts).
+    link_issued_at             TEXT,
+    reminder_sent_at           TEXT,
+    reissue_count              INTEGER NOT NULL DEFAULT 0,
     created_at                 TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
 );
 
@@ -205,6 +221,33 @@ def _has_replica_metadata() -> bool:
     had no connectivity yet the first time it started).
     """
     return _replica_metadata_path().exists()
+
+
+# Columns added after transactions already existed in a deployed db/tolling.db
+# and Turso -- CREATE TABLE IF NOT EXISTS (SCHEMA above) only reaches a
+# brand-new database, so an already-existing transactions table needs an
+# actual migration. See _migrate_schema().
+_TRANSACTIONS_MIGRATION_COLUMNS = {
+    "checkout_url": "TEXT",
+    "link_issued_at": "TEXT",
+    "reminder_sent_at": "TEXT",
+    "reissue_count": "INTEGER NOT NULL DEFAULT 0",
+}
+
+
+def _migrate_schema(conn: _Connection) -> None:
+    """Add any of _TRANSACTIONS_MIGRATION_COLUMNS missing from transactions.
+
+    ALTER TABLE ADD COLUMN errors on a column that already exists, so this
+    checks PRAGMA table_info first rather than assuming a fresh install --
+    safe to call every init_db(), against a brand-new table (SCHEMA above
+    already created these columns, so this is a no-op) or an existing one
+    that predates them.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+    for column, sql_type in _TRANSACTIONS_MIGRATION_COLUMNS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE transactions ADD COLUMN {column} {sql_type}")
 
 
 def init_db() -> None:
@@ -259,6 +302,7 @@ def init_db() -> None:
             print(f"Turso replica bootstrap failed, starting local-only: {e}", file=sys.stderr)
     with get_connection() as conn:
         conn.executescript(SCHEMA)
+        _migrate_schema(conn)
         conn.executemany(
             "INSERT OR IGNORE INTO toll_rates (vehicle_type, rate_ghs) VALUES (?, ?)",
             list(TOLL_RATES.items()),
@@ -419,22 +463,28 @@ def start_background_sync(interval_seconds: float = TURSO_SYNC_INTERVAL_SECONDS)
 
 def get_vehicle_by_rfid(rfid_uid: str) -> Optional[Row]:
     """Look up a registered vehicle by its RFID tag UID."""
+    logger.debug("DB query: vehicles WHERE rfid_uid=%s AND is_active=1", rfid_uid)
     with get_connection() as conn:
         cursor = conn.execute(
             "SELECT * FROM vehicles WHERE rfid_uid = ? AND is_active = 1",
             (rfid_uid,),
         )
-        return cursor.fetchone()
+        row = cursor.fetchone()
+        logger.debug("DB result: %s", "vehicle_id=%s" % row["vehicle_id"] if row else "no match")
+        return row
 
 
 def get_vehicle_by_plate(plate_number: str) -> Optional[Row]:
     """Look up a registered vehicle by ANPR-detected plate number."""
+    logger.debug("DB query: vehicles WHERE plate_number=%s AND is_active=1", plate_number)
     with get_connection() as conn:
         cursor = conn.execute(
             "SELECT * FROM vehicles WHERE plate_number = ? AND is_active = 1",
             (plate_number,),
         )
-        return cursor.fetchone()
+        row = cursor.fetchone()
+        logger.debug("DB result: %s", "vehicle_id=%s" % row["vehicle_id"] if row else "no match")
+        return row
 
 
 def has_recent_transaction(vehicle_id: int, within_seconds: float) -> bool:
@@ -455,7 +505,11 @@ def has_recent_transaction(vehicle_id: int, within_seconds: float) -> bool:
             """,
             (vehicle_id, f"-{within_seconds} seconds"),
         )
-        return cursor.fetchone() is not None
+        recent = cursor.fetchone() is not None
+        logger.debug(
+            "has_recent_transaction(vehicle_id=%s, within=%ss) -> %s", vehicle_id, within_seconds, recent
+        )
+        return recent
 
 
 def log_transaction(
@@ -491,7 +545,12 @@ def log_transaction(
                 momo_reference,
             ),
         )
-        return cursor.lastrowid
+        transaction_id = cursor.lastrowid
+        logger.debug(
+            "DB insert: transactions id=%s vehicle_id=%s method=%s amount=%.2f status=%s",
+            transaction_id, vehicle_id, identification_method, toll_amount, payment_status,
+        )
+        return transaction_id
 
 
 def log_audit_event(
@@ -500,6 +559,7 @@ def log_audit_event(
     transaction_id: Optional[int] = None,
 ) -> None:
     """Insert an audit_log entry. Use for system-level events, not transactions."""
+    logger.debug("DB insert: audit_log event_type=%s detail=%s transaction_id=%s", event_type, event_detail, transaction_id)
     with get_connection() as conn:
         conn.execute(
             """
@@ -515,14 +575,23 @@ def update_transaction_status(
     payment_status: str,
     momo_reference: Optional[str] = None,
 ) -> None:
-    """Update a transaction's payment outcome after the MoMo /charge call returns.
+    """Update a transaction's final payment outcome.
 
-    Call this once, after api_clients/momo.py gets a response — not before.
+    Two callers today: core.main._charge_vehicle marks a transaction FAILED
+    immediately if initialize_transaction() itself fails (no checkout link
+    was ever issued, so there's nothing to poll); workers/charge's cron
+    polling marks SUCCESS/FAILED once Paystack's verify endpoint resolves a
+    transaction that did get a link (that path writes directly to Turso in
+    TypeScript, not through this function -- this is the Python-only path).
     payment_status must be 'SUCCESS' or 'FAILED'.
     """
     if payment_status not in ("SUCCESS", "FAILED"):
         raise ValueError(f"Invalid payment_status: {payment_status!r}")
 
+    logger.debug(
+        "DB update: transactions id=%s -> payment_status=%s momo_reference=%s",
+        transaction_id, payment_status, momo_reference,
+    )
     with get_connection() as conn:
         conn.execute(
             """
@@ -534,19 +603,33 @@ def update_transaction_status(
         )
 
 
-def set_transaction_reference(transaction_id: int, momo_reference: str) -> None:
-    """Record a Paystack reference on a transaction still awaiting resolution.
+def set_transaction_reference(transaction_id: int, momo_reference: str, checkout_url: str) -> None:
+    """Record a fresh Paystack checkout link on a transaction, and stamp
+    link_issued_at to now.
 
-    Call this when charge_toll() comes back 'pending' (main.py's
-    handle_uid does). workers/charge's webhook (Phase 3) looks transactions
-    up by momo_reference to resolve them to SUCCESS/FAILED once Paystack's
-    charge.success/charge.failed event arrives — without this, a pending
-    transaction has no reference on it for the webhook to match against.
+    Call this once initialize_transaction() returns a reference AND its
+    authorization_url (core.main's _charge_vehicle does, right before
+    sending the checkout-link SMS). Both get stored, not just the
+    reference: workers/charge's cron polling (replaces the old webhook)
+    looks transactions up by momo_reference to resolve them to
+    SUCCESS/FAILED, and separately needs checkout_url verbatim to resend
+    the *same* link in a reminder SMS -- the two values are independent in
+    Paystack's response, so checkout_url can't be reconstructed from
+    momo_reference alone.
+
+    link_issued_at is distinct from created_at: it's when the *current*
+    link was sent, so workers/charge's 2-hour reminder timer measures from
+    here. This is the only place Python sets any of this (the initial
+    send); a reissued link stamps all three again itself, directly in Turso.
     """
     with get_connection() as conn:
         conn.execute(
-            "UPDATE transactions SET momo_reference = ? WHERE transaction_id = ?",
-            (momo_reference, transaction_id),
+            """
+            UPDATE transactions
+            SET momo_reference = ?, checkout_url = ?, link_issued_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
+            WHERE transaction_id = ?
+            """,
+            (momo_reference, checkout_url, transaction_id),
         )
 
 

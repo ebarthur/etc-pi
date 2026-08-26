@@ -1,10 +1,12 @@
 """
 tests/test_integration.py
 
-End-to-end test of the identify -> charge -> log loop (core.main.handle_uid,
-core.main.handle_plate) against a throwaway SQLite file, not db/tolling.db.
-Paystack's and Arkesel's HTTP calls are mocked so this suite runs fully
-offline and deterministically.
+End-to-end test of the identify -> create payment link -> log loop
+(core.main.handle_uid, core.main.handle_plate) against a throwaway SQLite
+file, not db/tolling.db. Paystack's and Arkesel's HTTP calls are mocked so
+this suite runs fully offline and deterministically. Resolving a payment
+link to SUCCESS/FAILED happens later, out-of-band, via workers/charge's
+cron polling (TypeScript, not covered by this Python suite).
 
 momo.py and arkesel.py both do a bare `import requests`, so they share the
 same `requests` module object — patching `requests.post` once (routed by
@@ -22,10 +24,19 @@ import core.db as db
 import core.main as main
 from anpr.yolov11 import PlateRead
 
-PAYSTACK_SUCCESS = {
+PAYSTACK_INITIALIZE_SUCCESS = {
     "status": True,
-    "message": "Charge attempted",
-    "data": {"status": "success", "reference": "ref_123"},
+    "message": "Authorization URL created",
+    "data": {
+        "authorization_url": "https://checkout.paystack.com/ref_123",
+        "access_code": "ref_123",
+        "reference": "ref_123",
+    },
+}
+PAYSTACK_INITIALIZE_FAILURE = {
+    "status": False,
+    "message": "Invalid key",
+    "data": {},
 }
 ARKESEL_SUCCESS = {"status": "success", "message": "sent"}
 
@@ -36,8 +47,13 @@ def _fake_response(json_data):
     return response
 
 
-def _patch_http(monkeypatch, paystack_data=PAYSTACK_SUCCESS, arkesel_data=ARKESEL_SUCCESS):
+def _patch_http(monkeypatch, paystack_data=PAYSTACK_INITIALIZE_SUCCESS, arkesel_data=ARKESEL_SUCCESS):
+    """Patches requests.post and returns the list of (url, kwargs) calls made,
+    so tests can inspect what was actually sent (e.g. the SMS body)."""
+    calls = []
+
     def side_effect(url, **kwargs):
+        calls.append((url, kwargs))
         if url.startswith(momo.PAYSTACK_BASE_URL):
             return _fake_response(paystack_data)
         if url == arkesel.ARKESEL_SEND_URL:
@@ -45,6 +61,7 @@ def _patch_http(monkeypatch, paystack_data=PAYSTACK_SUCCESS, arkesel_data=ARKESE
         raise AssertionError(f"Unexpected POST to {url}")
 
     monkeypatch.setattr(requests, "post", MagicMock(side_effect=side_effect))
+    return calls
 
 
 @pytest.fixture(autouse=True)
@@ -82,8 +99,15 @@ def _register_test_vehicle(rfid_uid):
     )
 
 
-def test_known_uid_charges_and_logs_success(monkeypatch, capsys):
-    _patch_http(monkeypatch)
+def _arkesel_message(calls):
+    for url, kwargs in calls:
+        if url == arkesel.ARKESEL_SEND_URL:
+            return kwargs["json"]["message"]
+    return None
+
+
+def test_known_uid_creates_payment_link_and_texts_it(monkeypatch, capsys):
+    calls = _patch_http(monkeypatch)
     vehicle_id = _register_test_vehicle("TESTUID01")
 
     main.handle_uid("TESTUID01")
@@ -93,10 +117,13 @@ def test_known_uid_charges_and_logs_success(monkeypatch, capsys):
             "SELECT * FROM transactions WHERE vehicle_id = ?", (vehicle_id,)
         ).fetchone()
 
-    assert txn["payment_status"] == "SUCCESS"
+    assert txn["payment_status"] == "PENDING"
     assert txn["momo_reference"] == "ref_123"
-    assert txn["toll_amount"] == 5.00  # seeded 'car' rate
-    assert "charge success" in capsys.readouterr().out
+    assert txn["link_issued_at"] is not None
+    assert txn["toll_amount"] == 0.50  # seeded 'car' rate
+    assert "payment link sent" in capsys.readouterr().out
+    assert "https://checkout.paystack.com/ref_123" in _arkesel_message(calls)
+    assert "GT-TESTUID01" in _arkesel_message(calls)  # plate number included in the SMS
 
 
 def test_unknown_uid_logs_audit_event_not_transaction(monkeypatch):
@@ -115,15 +142,8 @@ def test_unknown_uid_logs_audit_event_not_transaction(monkeypatch):
     assert "uid=NOTREGISTERED" in audit_row["event_detail"]
 
 
-def test_pending_charge_leaves_transaction_pending(monkeypatch):
-    _patch_http(
-        monkeypatch,
-        paystack_data={
-            "status": True,
-            "message": "Charge attempted",
-            "data": {"status": "pending", "reference": "ref_pending"},
-        },
-    )
+def test_payment_init_failure_marks_transaction_failed(monkeypatch):
+    calls = _patch_http(monkeypatch, paystack_data=PAYSTACK_INITIALIZE_FAILURE)
     vehicle_id = _register_test_vehicle("TESTUID02")
 
     main.handle_uid("TESTUID02")
@@ -133,45 +153,22 @@ def test_pending_charge_leaves_transaction_pending(monkeypatch):
             "SELECT * FROM transactions WHERE vehicle_id = ?", (vehicle_id,)
         ).fetchone()
         audit_row = conn.execute(
-            "SELECT * FROM audit_log WHERE event_type = 'CHARGE_PENDING'"
-        ).fetchone()
-
-    assert txn["payment_status"] == "PENDING"
-    assert txn["momo_reference"] == "ref_pending"
-    assert audit_row is not None
-
-
-def test_failed_charge_updates_status_and_logs_audit_event(monkeypatch):
-    _patch_http(
-        monkeypatch,
-        paystack_data={
-            "status": True,
-            "message": "Insufficient funds",
-            "data": {"status": "failed", "reference": "ref_failed"},
-        },
-    )
-    vehicle_id = _register_test_vehicle("TESTUID03")
-
-    main.handle_uid("TESTUID03")
-
-    with db.get_connection() as conn:
-        txn = conn.execute(
-            "SELECT * FROM transactions WHERE vehicle_id = ?", (vehicle_id,)
-        ).fetchone()
-        audit_row = conn.execute(
-            "SELECT * FROM audit_log WHERE event_type = 'CHARGE_FAILED'"
+            "SELECT * FROM audit_log WHERE event_type = 'PAYMENT_INIT_FAILED'"
         ).fetchone()
 
     assert txn["payment_status"] == "FAILED"
+    assert txn["momo_reference"] is None
     assert audit_row is not None
+    # No checkout link exists on init failure, so no SMS should have been attempted.
+    assert _arkesel_message(calls) is None
 
 
 def _fake_plate(text, confidence=0.9):
     return PlateRead(text=text, ocr_confidence=confidence, detector_confidence=confidence, box=(0, 0, 10, 10))
 
 
-def test_known_plate_charges_and_logs_success(monkeypatch, capsys):
-    _patch_http(monkeypatch)
+def test_known_plate_creates_payment_link_and_texts_it(monkeypatch, capsys):
+    calls = _patch_http(monkeypatch)
     vehicle_id = _register_test_vehicle("TESTUID04")  # plate_number="GT-TESTUID04"
 
     main.handle_plate(_fake_plate("GT-TESTUID04", confidence=0.81))
@@ -181,11 +178,12 @@ def test_known_plate_charges_and_logs_success(monkeypatch, capsys):
             "SELECT * FROM transactions WHERE vehicle_id = ?", (vehicle_id,)
         ).fetchone()
 
-    assert txn["payment_status"] == "SUCCESS"
+    assert txn["payment_status"] == "PENDING"
     assert txn["identification_method"] == "ANPR"
     assert txn["anpr_plate_detected"] == "GT-TESTUID04"
     assert txn["fallback_triggered"] == 1
-    assert "charge success" in capsys.readouterr().out
+    assert "payment link sent" in capsys.readouterr().out
+    assert "https://checkout.paystack.com/ref_123" in _arkesel_message(calls)
 
 
 def test_unknown_plate_logs_audit_event_not_transaction(monkeypatch):
@@ -207,7 +205,7 @@ def test_unknown_plate_logs_audit_event_not_transaction(monkeypatch):
 def test_second_pass_within_cooldown_is_skipped_not_double_charged(monkeypatch):
     """Neither identification path de-dupes on its own -- a vehicle re-seen
     (RFID again, or ANPR now) within TOLL_REPEAT_COOLDOWN_SECONDS of its last
-    transaction must not be charged a second time. See core.main._charge_vehicle."""
+    transaction must not get a second payment link. See core.main._charge_vehicle."""
     _patch_http(monkeypatch)
     _register_test_vehicle("TESTUID05")
 

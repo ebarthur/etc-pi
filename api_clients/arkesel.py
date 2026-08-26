@@ -1,19 +1,22 @@
 """
 api_clients/arkesel.py
 
-SMS notification client using Arkesel's SMS API v2 (sms.arkesel.com), for
-toll-passage notifications to vehicle owners. Separate from the actual
-charge — this is informational, sent alongside (not gating) momo.charge_toll.
-
-Response schema is inferred from Arkesel's public docs, not verified
-against a real account/key (none available yet) — worth a quick sanity
-check against a real response once ARKESEL_API_KEY is set.
+SMS client using Arkesel's SMS API v2 (sms.arkesel.com). send_payment_link_sms
+below is the only message core/main.py sends synchronously -- the checkout
+link a vehicle owner needs to actually pay their toll (momo.py's
+initialize_transaction hosted-checkout flow). Reminder and reissue SMS for a
+link that's gone unpaid are sent later, out-of-band, by workers/charge's
+cron polling (a separate TypeScript reimplementation of send_sms's request
+shape, since that runs independently of the Pi).
 """
 
+import logging
 import requests
-from typing import TypedDict
+from typing import Optional, TypedDict
 
 from core.config import ARKESEL_API_KEY, ARKESEL_SENDER_ID
+
+logger = logging.getLogger(__name__)
 
 ARKESEL_SEND_URL = "https://sms.arkesel.com/api/v2/sms/send"
 
@@ -50,29 +53,53 @@ def send_sms(phone_number: str, message: str) -> SmsResult:
         "Content-Type": "application/json",
     }
 
+    logger.debug(
+        "HTTP request: POST %s headers=%s body=%s",
+        ARKESEL_SEND_URL,
+        {**headers, "api-key": "***redacted***"},
+        payload,
+    )
     try:
         response = requests.post(ARKESEL_SEND_URL, json=payload, headers=headers, timeout=10)
+        logger.debug(
+            "HTTP response: %s %s headers=%s body=%s",
+            response.status_code, response.reason, dict(response.headers), response.text,
+        )
     except requests.RequestException as e:
+        logger.warning("Arkesel SMS request failed: %s", e)
         return SmsResult(success=False, message=str(e))
 
     try:
         data = response.json()
     except ValueError:
+        logger.warning("Arkesel SMS non-JSON response: HTTP %s", response.status_code)
         return SmsResult(success=False, message=f"HTTP {response.status_code}: {response.text[:200]}")
 
     success = data.get("status") == "success"
-    return SmsResult(success=success, message=data.get("message", data.get("status", "")))
+    result = SmsResult(success=success, message=data.get("message", data.get("status", "")))
+    logger.debug("Arkesel SMS result: %s", result)
+    return result
 
 
-def send_toll_notification(phone_number: str, toll_point_name: str, amount_ghs: float) -> SmsResult:
-    """Notify a vehicle owner they've passed a toll point and will be charged.
+def send_payment_link_sms(
+    phone_number: str,
+    toll_point_name: str,
+    amount_ghs: float,
+    authorization_url: str,
+    plate_number: Optional[str] = None,
+) -> SmsResult:
+    """Send a vehicle owner their Paystack checkout link to pay a toll.
 
-    Sent before the charge is attempted (informational — doesn't gate or
-    confirm payment, just tells the driver what's about to happen).
+    Sent right after momo.initialize_transaction() succeeds -- this is the
+    only way the owner learns there's a toll to pay and where to pay it;
+    nothing else in the flow charges them directly. `plate_number` can be
+    None (a vehicle may be registered with only an rfid_uid, no plate — see
+    scripts/register_vehicle.py), so the copy falls back to "Your vehicle".
     """
+    vehicle_ref = plate_number or "Your vehicle"
     message = (
         f"You've passed {toll_point_name}. "
-        f"GHS {amount_ghs:.2f} will be deducted from your account for the toll fee. "
+        f"{vehicle_ref}'s GHS {amount_ghs:.2f} toll is ready to pay: {authorization_url} "
         f"Safe travels!"
     )
     return send_sms(phone_number, message)
