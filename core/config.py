@@ -30,7 +30,7 @@ PAYSTACK_BASE_URL = "https://api.paystack.co"
 # by TURSO_SYNC_INTERVAL_SECONDS. See plan.md Phase 4.
 TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL", "")
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
-TURSO_SYNC_INTERVAL_SECONDS = float(os.environ.get("TURSO_SYNC_INTERVAL_SECONDS") or "30")
+TURSO_SYNC_INTERVAL_SECONDS = float(os.environ.get("TURSO_SYNC_INTERVAL_SECONDS") or "5")
 
 # --- SMS (Arkesel) ---
 ARKESEL_API_KEY = os.environ.get("ARKESEL_API_KEY", "")

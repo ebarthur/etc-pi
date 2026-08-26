@@ -17,9 +17,11 @@ anpr/captures/*
 # Roadside ANPR live-test output (frames, crops, JSONL) — see anpr/live_test.py
 anpr/live_runs/
 
-# Local DB (includes libsql's embedded-replica sidecar files: -info, -wal, -shm)
-db/*.db
-db/*.db-*
+# Local DB (includes libsql's embedded-replica sidecar files: -info, -wal, -shm).
+# **/ so this also catches db/backup_*/ snapshots left by core.db's replica
+# self-heal (core/db.py's _repair_replica_conflict), not just db/ itself.
+db/**/*.db
+db/**/*.db-*
 
 # Dead directory — filesystem corruption made it unreadable/undeletable (needs e2fsck to
 # reclaim). Mock data now lives in api_clients/fixtures/ instead.

@@ -190,13 +190,17 @@ def handle_no_read(capture_path: Optional[str] = None) -> None:
     """Called when a confirmed vehicle's RFID window times out AND the ANPR
     fallback found no plate read above ANPR_OCR_MIN_CONFIDENCE.
 
-    Genuinely nothing left to try — logged so it's traceable (and, with
-    `capture_path`, reviewable) rather than silently dropped.
+    Genuinely nothing left to try. This is by far the most common outcome of
+    a presence trigger in practice (far more common than an actual charge),
+    so it's deliberately NOT written to audit_log/Turso -- doing that turned
+    it into the dominant source of DB writes, competing with workers/charge's
+    own writes on the same tables for no operational benefit. Local logging
+    (below) plus the captured frame (`capture_path`, written by the caller)
+    is enough to review a miss after the fact.
     """
     detail = "no RFID tag and no ANPR plate read above confidence threshold"
     if capture_path:
         detail += f"; frame captured to {capture_path}"
-    log_audit_event("IDENTIFICATION_FAILED", event_detail=detail)
     logger.warning("IDENTIFICATION FAILED: %s", detail)
     print(f"No identification within timeout ({detail}) — skipping.")
 

@@ -10,10 +10,18 @@
  * checkout reference, verify each against Paystack (GET /transaction/verify/:reference), and
  * act on the result --
  *
- *   success            -> mark the transaction SUCCESS.
- *   failed / abandoned -> reissue ONE fresh checkout link (a new /transaction/initialize
- *                         call) and text it; a second failure/abandonment marks the
- *                         transaction terminally FAILED instead of reissuing again.
+ *   success            -> mark the transaction SUCCESS and text the customer a payment-received
+ *                         confirmation.
+ *   failed / abandoned -> Paystack can report this transiently mid-flow -- e.g. a momo charge
+ *                         that's still waiting on the customer's approval prompt -- and it can
+ *                         still resolve to success on the *same* reference a minute later. So
+ *                         this is NOT acted on immediately: only once the current link
+ *                         (link_issued_at) is >= 2 hours old does it count as truly dead --
+ *                         at that point, reissue ONE fresh checkout link (a new
+ *                         /transaction/initialize call) and text it; a second
+ *                         failure/abandonment (still >= 2 hours old) marks the transaction
+ *                         terminally FAILED instead of reissuing again. Younger than 2 hours,
+ *                         just keep polling the same reference next tick -- no action, no text.
  *   anything else       -> still genuinely pending. If the *current* link
  *   (pending/processing)  (link_issued_at) is >= 2 hours old and no reminder has gone out
  *                         yet for it, text a reminder with the same link.
@@ -134,23 +142,26 @@ function vehicleRef(plateNumber: string | null): string {
 
 // Same idempotent-guard pattern the old webhook used: the UPDATE's own WHERE
 // payment_status = 'PENDING' means a redelivered/overlapping run that already lost the race
-// just gets rowsAffected = 0 and skips the audit write, rather than double-logging.
+// just gets rowsAffected = 0 and skips the audit write, rather than double-logging. Returns
+// whether this call actually applied the change, so callers can gate a one-shot side effect
+// (e.g. the payment-received SMS) on having genuinely won that race.
 async function markResolved(
   turso: Client,
   transactionId: number,
   status: "SUCCESS" | "FAILED",
   eventType: string,
   detail: string,
-): Promise<void> {
+): Promise<boolean> {
   const result = await turso.execute({
     sql: "UPDATE transactions SET payment_status = ? WHERE transaction_id = ? AND payment_status = 'PENDING'",
     args: [status, transactionId],
   });
-  if (result.rowsAffected === 0) return;
+  if (result.rowsAffected === 0) return false;
   await turso.execute({
     sql: "INSERT INTO audit_log (transaction_id, event_type, event_detail) VALUES (?, ?, ?)",
     args: [transactionId, eventType, detail],
   });
+  return true;
 }
 
 function isOlderThan(sqliteDatetimeUtc: string, ms: number): boolean {
@@ -252,17 +263,30 @@ async function resolveOne(turso: Client, env: Env, row: PendingRow): Promise<voi
   if (!verified) return;
 
   if (verified.status === "success") {
-    await markResolved(
+    const applied = await markResolved(
       turso,
       row.transaction_id,
       "SUCCESS",
       "PAYMENT_VERIFIED_SUCCESS",
       `ref=${row.momo_reference}`,
     );
+    if (applied) {
+      await sendSms(
+        env,
+        row.phone_number,
+        `Payment received for ${vehicleRef(row.plate_number)}'s GHS ${row.toll_amount.toFixed(2)} toll ` +
+          `at ${env.TOLL_GATE_NAME}. Safe travels!`,
+      );
+    }
     return;
   }
 
   if (verified.status === "failed" || verified.status === "abandoned") {
+    // Not necessarily really over -- e.g. a momo charge can sit "abandoned" while the
+    // customer is still completing an approval prompt, then flip to "success" on this same
+    // reference a minute later. Only escalate once the link's genuinely been outstanding for
+    // 2 hours; otherwise just leave it alone and re-verify the same reference next tick.
+    if (!isOlderThan(row.link_issued_at, REMINDER_AFTER_MS)) return;
     await handleTerminalFailure(turso, env, row, verified.status);
     return;
   }

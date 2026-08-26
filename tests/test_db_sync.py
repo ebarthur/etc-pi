@@ -108,3 +108,102 @@ def test_start_background_sync_spawns_a_daemon_thread_when_configured(tmp_path, 
     assert db._sync_thread is not None
     assert db._sync_thread.daemon is True
     assert db._sync_thread.is_alive()
+
+
+# --- Self-healing recovery from an unrecoverable replica conflict ---
+
+
+def test_is_conflict_error_distinguishes_conflict_from_ordinary_failures():
+    assert db._is_conflict_error(Exception("sync error: server returned a conflict: sent=112, got=115"))
+    assert not db._is_conflict_error(Exception("Name or service not known"))
+    assert not db._is_conflict_error(Exception("Connection timed out"))
+
+
+def test_conflict_failures_only_trigger_repair_after_threshold(tmp_path, monkeypatch):
+    _use_throwaway_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(db, "TURSO_DATABASE_URL", BOGUS_SYNC_URL)
+    monkeypatch.setattr(db, "TURSO_AUTH_TOKEN", "fake-token-for-test")
+    monkeypatch.setattr(db, "_consecutive_conflict_failures", 0)
+
+    repair_calls = []
+    monkeypatch.setattr(db, "_repair_replica_conflict", lambda e: repair_calls.append(e))
+
+    def _raise_conflict():
+        raise Exception("sync error: server returned a conflict: sent=1, got=2")
+
+    monkeypatch.setattr(db, "_open_offline_connection", lambda: (_ for _ in ()).throw(
+        Exception("sync error: server returned a conflict: sent=1, got=2")
+    ))
+
+    assert db._CONFLICT_REPAIR_THRESHOLD == 2  # this test assumes the current threshold
+
+    assert db._sync_once(log_failures=False) is False
+    assert repair_calls == []  # first conflict alone must not trigger repair
+
+    assert db._sync_once(log_failures=False) is False
+    assert len(repair_calls) == 1  # second consecutive conflict does
+
+
+def test_non_conflict_failures_never_trigger_repair(tmp_path, monkeypatch):
+    _use_throwaway_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(db, "TURSO_DATABASE_URL", BOGUS_SYNC_URL)
+    monkeypatch.setattr(db, "TURSO_AUTH_TOKEN", "fake-token-for-test")
+    monkeypatch.setattr(db, "_consecutive_conflict_failures", 0)
+
+    repair_calls = []
+    monkeypatch.setattr(db, "_repair_replica_conflict", lambda e: repair_calls.append(e))
+
+    # Real failure path (unresolvable host), exercised repeatedly -- ordinary
+    # offline retries must never be mistaken for the unrecoverable conflict.
+    for _ in range(5):
+        assert db._sync_once(log_failures=False) is False
+    assert repair_calls == []
+
+
+def test_push_local_only_rows_copies_missing_and_skips_existing(tmp_path, monkeypatch):
+    _use_throwaway_db(tmp_path, monkeypatch)
+
+    db.register_vehicle(phone_number="0551234567", plate_number="TEST-0001")
+    with db.get_connection() as conn:
+        conn.execute(
+            "INSERT INTO transactions (transaction_id, vehicle_id, identification_method, toll_amount, payment_status) "
+            "VALUES (1, 1, 'ANPR', 0.5, 'PENDING')"
+        )
+        conn.execute(
+            "INSERT INTO transactions (transaction_id, vehicle_id, identification_method, toll_amount, payment_status) "
+            "VALUES (2, 1, 'ANPR', 0.5, 'PENDING')"
+        )
+        conn.execute("INSERT INTO audit_log (log_id, event_type) VALUES (1, 'A')")
+        conn.execute("INSERT INTO audit_log (log_id, event_type) VALUES (2, 'B')")
+    local = db._Connection(db.libsql.connect(str(db.DB_PATH)))
+
+    remote_path = tmp_path / "remote.db"
+    remote = db._Connection(db.libsql.connect(str(remote_path)))
+    remote.executescript(db.SCHEMA)
+    # Only exercising the row-diff/copy logic here, not referential
+    # integrity against a full vehicles/toll_rates seed on this throwaway
+    # remote file.
+    remote.execute("PRAGMA foreign_keys = OFF")
+    # remote already has transaction_id=1 (with a DIFFERENT, more current
+    # status than local's stale PENDING copy) and log_id=1 -- these must be
+    # left untouched, only the genuinely-missing rows get copied.
+    remote.execute(
+        "INSERT INTO transactions (transaction_id, vehicle_id, identification_method, toll_amount, payment_status) "
+        "VALUES (1, 1, 'ANPR', 0.5, 'SUCCESS')"
+    )
+    remote.execute("INSERT INTO audit_log (log_id, event_type) VALUES (1, 'A')")
+    remote.commit()
+
+    copied = db._push_local_only_rows(remote, local)
+    remote.commit()
+
+    assert copied == 2  # transaction_id=2 and log_id=2 only
+
+    txn1 = remote.execute("SELECT payment_status FROM transactions WHERE transaction_id = 1").fetchone()
+    assert txn1["payment_status"] == "SUCCESS"  # remote's copy was not overwritten
+
+    txn2 = remote.execute("SELECT * FROM transactions WHERE transaction_id = 2").fetchone()
+    assert txn2 is not None  # the missing one was copied over
+
+    local.close()
+    remote.close()

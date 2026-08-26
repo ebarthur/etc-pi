@@ -250,6 +250,46 @@ def _migrate_schema(conn: _Connection) -> None:
             conn.execute(f"ALTER TABLE transactions ADD COLUMN {column} {sql_type}")
 
 
+# Guards DB_PATH (the file itself, not its contents) against a race between
+# get_connection() opening it and _repair_replica_conflict() briefly making
+# it not exist while rebuilding it (move old file aside, bootstrap-pull a
+# fresh one). get_connection() only holds this around the decide+connect
+# step, so the normal hot path never blocks on anything -- only a
+# get_connection() call that lands during an actual repair (rare: a real,
+# unrecoverable sync conflict, not routine offline retries) waits for it.
+_db_path_lock = threading.Lock()
+
+
+def _bootstrap_fresh_replica() -> bool:
+    """One-time pull of the full remote database into a brand-new DB_PATH.
+
+    Used both by init_db() (DB_PATH doesn't exist yet -- first boot, or after
+    db/ was wiped by hand) and by _repair_replica_conflict() below (DB_PATH
+    was just moved aside after an unrecoverable sync conflict). See
+    _has_replica_metadata()'s docstring for why this first-ever open of a
+    given path must be a non-offline synced connection, and why the explicit
+    .sync() call (not just connect()) is required — skipping it leaves the
+    local replica's frame baseline stale, so the *next* push gets rejected
+    with "server returned a conflict" against a Turso DB that already has
+    other data on it.
+
+    Best-effort: returns False (falling back to a plain local file, or in
+    the repair case leaving the corrupt replica moved aside with nothing to
+    replace it until the next attempt) rather than raising, so a box with no
+    connectivity yet still boots.
+    """
+    try:
+        bootstrap_conn = _open_synced_connection()
+        try:
+            bootstrap_conn.sync()
+        finally:
+            bootstrap_conn.close()
+        return True
+    except Exception as e:
+        print(f"Turso replica bootstrap failed, starting local-only: {e}", file=sys.stderr)
+        return False
+
+
 def init_db() -> None:
     """Create the database file, schema, and seed default toll rates.
 
@@ -266,40 +306,7 @@ def init_db() -> None:
     """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN and not DB_PATH.exists():
-        # See _has_replica_metadata()'s docstring for why this first-ever
-        # open has to be a synced one, before any plain connection can touch
-        # DB_PATH. Deliberately the plain (non-offline) synced connect, not
-        # _open_offline_connection() below — confirmed empirically that
-        # offline=True on a truly fresh file, if anything gets written to it
-        # before an explicit sync(), can hit "server returned a conflict"
-        # against a Turso DB that already has data on it from elsewhere;
-        # this bootstrap only pulls, writing no data itself.
-        #
-        # The explicit .sync() call here (not just connect()) is required,
-        # not optional: confirmed empirically that skipping it leaves the
-        # local replica's frame baseline stale, so the *next* push (whether
-        # from this process's own _sync_once() or the background thread)
-        # gets rejected with "server returned a conflict" against a Turso DB
-        # that already has other data on it — connect() alone creates the
-        # metadata sidecar but does not itself pull the remote's current
-        # state into it.
-        #
-        # Best-effort: if this box has never had connectivity (e.g. a Pi's
-        # very first boot with no signal yet), this raises and we fall back
-        # to a fully local plain file for now — get_connection() below then
-        # stays plain (no metadata sidecar => no offline=True) until db/ is
-        # wiped and re-initialized while online. Not auto-retried later;
-        # this matches the project's existing "db/ is disposable scratch
-        # data, delete anytime" convention rather than adding a
-        # retry-to-upgrade-a-plain-file mechanism.
-        try:
-            bootstrap_conn = _open_synced_connection()
-            try:
-                bootstrap_conn.sync()
-            finally:
-                bootstrap_conn.close()
-        except Exception as e:
-            print(f"Turso replica bootstrap failed, starting local-only: {e}", file=sys.stderr)
+        _bootstrap_fresh_replica()
     with get_connection() as conn:
         conn.executescript(SCHEMA)
         _migrate_schema(conn)
@@ -342,12 +349,17 @@ def get_connection() -> Iterator[_Connection]:
     cross-thread sharing issues now that a background sync thread runs
     alongside main.py's RFID loop.
     """
-    if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN and _has_replica_metadata():
-        raw = libsql.connect(
-            str(DB_PATH), sync_url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN, offline=True
-        )
-    else:
-        raw = libsql.connect(str(DB_PATH))
+    # Held only around the decide+connect step below, not the query/commit
+    # that follows -- see _db_path_lock's docstring for what this protects
+    # against and why it doesn't cost the hot path anything in the normal
+    # (no repair in progress) case.
+    with _db_path_lock:
+        if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN and _has_replica_metadata():
+            raw = libsql.connect(
+                str(DB_PATH), sync_url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN, offline=True
+            )
+        else:
+            raw = libsql.connect(str(DB_PATH))
     conn = _Connection(raw)
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
@@ -389,12 +401,14 @@ _sync_thread_lock = threading.Lock()
 _last_sync_ok: Optional[bool] = None  # None = not yet attempted
 
 
-def _open_synced_connection() -> _Connection:
-    """Non-offline synced connection. Only for init_db()'s one-time bootstrap
-    of a brand-new DB_PATH — see its docstring for why. Everything else that
-    needs a synced connection uses _open_offline_connection() below."""
+def _open_synced_connection(path: Path = DB_PATH) -> _Connection:
+    """Non-offline synced connection. Used by _bootstrap_fresh_replica() (at
+    DB_PATH) and by _repair_replica_conflict() below (at a throwaway scratch
+    path, so it never touches the corrupt DB_PATH file it's diffing
+    against) — see their docstrings for why. Everything else that needs a
+    synced connection uses _open_offline_connection() below."""
     return _Connection(
-        libsql.connect(str(DB_PATH), sync_url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+        libsql.connect(str(path), sync_url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
     )
 
 
@@ -406,15 +420,151 @@ def _open_offline_connection() -> _Connection:
     )
 
 
+# --- Self-healing recovery from an unrecoverable replica conflict ---
+#
+# workers/charge writes straight to the Turso primary (resolving payments)
+# independently of this Pi's embedded-replica push. When both land on the
+# same table's tail page around the same moment, the replica's next sync()
+# can come back "server returned a conflict: sent=X, got=Y" -- a genuine
+# frame-position mismatch libsql won't silently resolve, not a transient
+# network blip. Left alone it just repeats forever (confirmed empirically:
+# retried the identical failure every ~30-40s for over 20 minutes straight
+# with no self-recovery), silently stranding every local write from that
+# point on -- nothing reaches Turso, so nothing reaches the dashboard,
+# until someone notices and manually intervenes. _CONFLICT_REPAIR_THRESHOLD
+# consecutive conflict failures (as opposed to ordinary offline/connectivity
+# failures, which are expected and must NOT trigger this) instead triggers
+# _repair_replica_conflict() below to fix it automatically.
+_CONFLICT_REPAIR_THRESHOLD = 2
+_consecutive_conflict_failures = 0
+
+
+def _is_conflict_error(e: Exception) -> bool:
+    """Whether a sync failure is the specific unrecoverable frame-position
+    conflict (see above), as opposed to an ordinary offline/connectivity
+    failure that's expected and should just keep retrying untouched."""
+    return "conflict" in str(e).lower()
+
+
+def _push_local_only_rows(remote: _Connection, local: _Connection) -> int:
+    """Copy transactions/audit_log rows that exist only in `local` (never
+    reached Turso) into `remote`, by primary-key diff. Never overwrites a
+    row `remote` already has -- Turso is authoritative for anything both
+    sides touched (workers/charge only ever moves a transaction PENDING ->
+    SUCCESS/FAILED there directly; a stale local copy of that same row is
+    expected and gets corrected for free once the replica re-bootstraps
+    from `remote` afterwards). Returns how many rows were copied, for
+    logging.
+    """
+    copied = 0
+
+    remote_txn_ids = {
+        r["transaction_id"] for r in remote.execute("SELECT transaction_id FROM transactions").fetchall()
+    }
+    for r in local.execute("SELECT * FROM transactions").fetchall():
+        if r["transaction_id"] in remote_txn_ids:
+            continue
+        remote.execute(
+            """
+            INSERT INTO transactions (
+                transaction_id, vehicle_id, identification_method, rfid_uid_scanned,
+                anpr_plate_detected, anpr_confidence, fallback_triggered, toll_amount,
+                payment_status, momo_reference, checkout_url, created_at, link_issued_at,
+                reminder_sent_at, reissue_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                r["transaction_id"], r["vehicle_id"], r["identification_method"], r["rfid_uid_scanned"],
+                r["anpr_plate_detected"], r["anpr_confidence"], r["fallback_triggered"], r["toll_amount"],
+                r["payment_status"], r["momo_reference"], r["checkout_url"], r["created_at"],
+                r["link_issued_at"], r["reminder_sent_at"], r["reissue_count"],
+            ),
+        )
+        copied += 1
+
+    remote_log_ids = {r["log_id"] for r in remote.execute("SELECT log_id FROM audit_log").fetchall()}
+    for r in local.execute("SELECT * FROM audit_log").fetchall():
+        if r["log_id"] in remote_log_ids:
+            continue
+        remote.execute(
+            "INSERT INTO audit_log (log_id, transaction_id, event_type, event_detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (r["log_id"], r["transaction_id"], r["event_type"], r["event_detail"], r["created_at"]),
+        )
+        copied += 1
+
+    return copied
+
+
+def _repair_replica_conflict(error: Exception) -> None:
+    """Recover from a sync stuck on the unrecoverable conflict described
+    above: salvage any local-only rows straight to Turso, then discard and
+    re-bootstrap the local replica so its frame baseline is clean again.
+
+    Holds _db_path_lock for the whole repair (including the network round
+    trips) so get_connection() can't observe DB_PATH mid-swap -- see that
+    lock's docstring. Best-effort: logs and gives up on any failure here
+    rather than raising, so a repair attempt that itself hits a network
+    blip just leaves things as they were for the next conflict tick to
+    retry, instead of taking down the sync thread.
+    """
+    print("Turso replica sync conflict looks permanent -- attempting self-heal...", file=sys.stderr)
+    scratch_path = DB_PATH.parent / "tolling.repair-scratch.db"
+
+    def _clear_scratch() -> None:
+        for suffix in ("", "-wal", "-shm", "-info"):
+            Path(str(scratch_path) + suffix).unlink(missing_ok=True)
+
+    with _db_path_lock:
+        try:
+            _clear_scratch()  # leftovers from a repair attempt that crashed mid-way
+            remote = _open_synced_connection(scratch_path)
+            try:
+                remote.sync()  # pull remote's current state so the diff below is accurate
+                local = _Connection(libsql.connect(str(DB_PATH)))
+                try:
+                    copied = _push_local_only_rows(remote, local)
+                finally:
+                    local.close()
+                remote.execute(
+                    "INSERT INTO audit_log (event_type, event_detail) VALUES (?, ?)",
+                    (
+                        "TURSO_REPLICA_RESET",
+                        f"conflict={str(error)[:300]}; salvaged {copied} local-only row(s) "
+                        "before resetting the local replica",
+                    ),
+                )
+            finally:
+                remote.close()
+                _clear_scratch()
+
+            backup_dir = DB_PATH.parent / f"backup_{time.strftime('%Y%m%d_%H%M%S')}"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            for suffix in ("", "-wal", "-shm", "-info"):
+                src = Path(str(DB_PATH) + suffix)
+                if src.exists():
+                    src.rename(backup_dir / src.name)
+
+            if _bootstrap_fresh_replica():
+                print("Turso replica self-heal complete.", file=sys.stderr)
+            else:
+                print("Turso replica self-heal: reset done but re-bootstrap failed; will retry.", file=sys.stderr)
+        except Exception as repair_error:
+            print(f"Turso replica self-heal failed: {repair_error}", file=sys.stderr)
+
+
 def _sync_once(log_failures: bool) -> bool:
     """Best-effort single sync attempt. Returns whether it succeeded.
 
     No-op (returns True) when Turso isn't configured. Failures — including
     just failing to connect, which is where a sync attempt actually fails
     when offline — are expected on a Pi with intermittent connectivity, so
-    this never raises.
+    this never raises. An unrecoverable conflict (as opposed to ordinary
+    offline retries) instead triggers a self-heal after
+    _CONFLICT_REPAIR_THRESHOLD consecutive occurrences — see
+    _repair_replica_conflict().
     """
-    global _last_sync_ok
+    global _last_sync_ok, _consecutive_conflict_failures
     if not (TURSO_DATABASE_URL and TURSO_AUTH_TOKEN):
         return True
     try:
@@ -431,8 +581,17 @@ def _sync_once(log_failures: bool) -> bool:
         if log_failures and _last_sync_ok is not False:
             log_audit_event("TURSO_SYNC_FAILED", event_detail=str(e)[:500])
         _last_sync_ok = False
+
+        if _is_conflict_error(e):
+            _consecutive_conflict_failures += 1
+            if _consecutive_conflict_failures >= _CONFLICT_REPAIR_THRESHOLD:
+                _consecutive_conflict_failures = 0
+                _repair_replica_conflict(e)
+        else:
+            _consecutive_conflict_failures = 0
         return False
 
+    _consecutive_conflict_failures = 0
     if log_failures and _last_sync_ok is False:
         log_audit_event("TURSO_SYNC_RESTORED")
     _last_sync_ok = True
