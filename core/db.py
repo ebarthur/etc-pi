@@ -34,7 +34,13 @@ from typing import Any, Iterator, Optional, Sequence
 
 import libsql
 
-from core.config import TOLL_RATES, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL, TURSO_SYNC_INTERVAL_SECONDS
+from core.config import (
+    TOLL_RATES,
+    TURSO_AUTH_TOKEN,
+    TURSO_DATABASE_URL,
+    TURSO_DRIFT_CHECK_INTERVAL_SECONDS,
+    TURSO_SYNC_INTERVAL_SECONDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -534,6 +540,13 @@ def _repair_replica_conflict(error: Exception) -> None:
                         "before resetting the local replica",
                     ),
                 )
+                # Confirmed empirically: a non-offline synced connection does NOT autocommit --
+                # closing it with an open transaction silently discards every write above,
+                # including the salvaged rows, with no error. Every other write path in this
+                # module commits explicitly (see get_connection()'s yield/commit); this one
+                # didn't, so the one time this ran for real it quietly threw away the exact
+                # rows it was trying to save.
+                remote.commit()
             finally:
                 remote.close()
                 _clear_scratch()
@@ -598,10 +611,114 @@ def _sync_once(log_failures: bool) -> bool:
     return True
 
 
+# --- Silent push-gap detection ---
+#
+# _sync_once() reporting success only means the sync() call itself didn't raise --
+# confirmed live 2026-08-27 that this is not the same thing as "every local write
+# reached Turso": a real transaction committed locally, five straight _sync_once()
+# calls each returned True, and the row still never showed up remotely. No error,
+# no conflict, so none of the existing failure/repair machinery above ever notices.
+# _check_sync_gap() below is a periodic, independent check for exactly that gap.
+_GAP_CONFIRM_THRESHOLD = 2
+_consecutive_gap_detections = 0
+_last_gap_ok: Optional[bool] = None
+
+
+def _check_sync_gap() -> None:
+    """Compare local vs. Turso's actual newest transaction_id/log_id.
+
+    Deliberately verifies via a throwaway independent replica (same technique
+    scripts/test_turso_sync.py uses), not the live offline connection get_connection()
+    and the push sync share -- that connection's own view of "did it land remotely"
+    is exactly what silently lied in the incident above, so it can't be trusted to
+    grade its own work. Only escalates (audit-logs, prints) after
+    _GAP_CONFIRM_THRESHOLD consecutive detections, so an ordinary write that simply
+    hasn't hit its next push cycle yet (this runs independently of
+    TURSO_SYNC_INTERVAL_SECONDS) doesn't read as a false alarm.
+
+    The audit_log comparison excludes this function's own TURSO_SYNC_GAP /
+    TURSO_SYNC_GAP_RESOLVED rows -- confirmed empirically this is not just
+    theoretical: logging TURSO_SYNC_GAP is itself a local write, so counting it
+    raises local_log_max on the very next tick, before that row has had a chance
+    to sync out; without this exclusion a real gap can never actually reach
+    "resolved" (the row announcing the gap keeps re-triggering the same gap it
+    announced) even once every toll-domain row has synced.
+    """
+    global _last_gap_ok, _consecutive_gap_detections
+    _SELF_EVENT_TYPES = ("TURSO_SYNC_GAP", "TURSO_SYNC_GAP_RESOLVED")
+    _log_max_sql = (
+        "SELECT COALESCE(MAX(log_id), 0) AS m FROM audit_log WHERE event_type NOT IN ({})".format(
+            ", ".join("?" for _ in _SELF_EVENT_TYPES)
+        )
+    )
+    try:
+        with get_connection() as local:
+            local_txn_max = local.execute(
+                "SELECT COALESCE(MAX(transaction_id), 0) AS m FROM transactions"
+            ).fetchone()["m"]
+            local_log_max = local.execute(_log_max_sql, _SELF_EVENT_TYPES).fetchone()["m"]
+    except Exception as e:
+        print(f"Turso drift check: local read failed: {e}", file=sys.stderr)
+        return
+
+    scratch_path = DB_PATH.parent / "tolling.driftcheck-scratch.db"
+
+    def _clear_scratch() -> None:
+        for suffix in ("", "-wal", "-shm", "-info"):
+            Path(str(scratch_path) + suffix).unlink(missing_ok=True)
+
+    try:
+        _clear_scratch()
+        remote = _open_synced_connection(scratch_path)
+        try:
+            remote.sync()
+            remote_txn_max = remote.execute(
+                "SELECT COALESCE(MAX(transaction_id), 0) AS m FROM transactions"
+            ).fetchone()["m"]
+            remote_log_max = remote.execute(_log_max_sql, _SELF_EVENT_TYPES).fetchone()["m"]
+        finally:
+            remote.close()
+            _clear_scratch()
+    except Exception as e:
+        print(f"Turso drift check: remote verify failed: {e}", file=sys.stderr)
+        return
+
+    if remote_txn_max < local_txn_max or remote_log_max < local_log_max:
+        _consecutive_gap_detections += 1
+        if _consecutive_gap_detections >= _GAP_CONFIRM_THRESHOLD:
+            if _last_gap_ok is not False:
+                detail = (
+                    f"transactions local_max={local_txn_max} remote_max={remote_txn_max}, "
+                    f"audit_log local_max={local_log_max} remote_max={remote_log_max}"
+                )
+                log_audit_event("TURSO_SYNC_GAP", event_detail=detail)
+                print(f"Turso sync gap detected: {detail}", file=sys.stderr)
+                # This gap is the "sync() reports success but pushes nothing" failure, not a
+                # conflict -- confirmed live (twice) that it recurs on a replica that's been
+                # running a while, not just a one-time fluke, and there's no error for
+                # _sync_once() to catch and route to _repair_replica_conflict() on its own. So
+                # trigger the same salvage-then-reset repair directly from here once per
+                # confirmed episode, rather than leaving this as alert-only and requiring
+                # someone to notice and fix it by hand every time.
+                _repair_replica_conflict(RuntimeError(f"silent push gap (non-error): {detail}"))
+            _last_gap_ok = False
+    else:
+        _consecutive_gap_detections = 0
+        if _last_gap_ok is False:
+            log_audit_event("TURSO_SYNC_GAP_RESOLVED")
+        _last_gap_ok = True
+
+
 def _sync_loop(interval_seconds: float) -> None:
+    last_drift_check = 0.0
     while True:
         time.sleep(interval_seconds)
         _sync_once(log_failures=True)
+
+        now = time.monotonic()
+        if now - last_drift_check >= TURSO_DRIFT_CHECK_INTERVAL_SECONDS:
+            last_drift_check = now
+            _check_sync_gap()
 
 
 def start_background_sync(interval_seconds: float = TURSO_SYNC_INTERVAL_SECONDS) -> None:

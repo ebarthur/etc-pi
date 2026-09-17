@@ -31,6 +31,12 @@ PAYSTACK_BASE_URL = "https://api.paystack.co"
 TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL", "")
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
 TURSO_SYNC_INTERVAL_SECONDS = float(os.environ.get("TURSO_SYNC_INTERVAL_SECONDS") or "5")
+# _sync_once()'s push can report success while a specific write silently never reaches
+# Turso (confirmed live 2026-08-27: no exception, no conflict, sync() just returns True
+# without the row landing remotely). core/db.py's _check_sync_gap() catches this via an
+# independent replica, on this much slower interval since it's a heavier round trip than
+# a routine push.
+TURSO_DRIFT_CHECK_INTERVAL_SECONDS = float(os.environ.get("TURSO_DRIFT_CHECK_INTERVAL_SECONDS") or "120")
 
 # --- SMS (Arkesel) ---
 ARKESEL_API_KEY = os.environ.get("ARKESEL_API_KEY", "")
@@ -169,3 +175,14 @@ DEV_STREAM_FPS = float(os.environ.get("DEV_STREAM_FPS") or "3.0")
 # and core/main.py's _charge_vehicle(). Shorten this for rig testing if you
 # deliberately want to re-pass the same vehicle sooner than the default.
 TOLL_REPEAT_COOLDOWN_SECONDS = float(os.environ.get("TOLL_REPEAT_COOLDOWN_SECONDS") or "60")
+
+# --- Identification-miss audit logging (core/main.py's handle_no_read) ---
+# Off by default on purpose: a "no RFID, no ANPR match" miss is by far the most common outcome
+# of a presence trigger in practice (see handle_no_read's docstring) -- logging every one of
+# them to audit_log/Turso turned it into the dominant source of DB writes, competing with real
+# transaction data for no operational benefit, on a Pi whose SD card has already shown real
+# corruption (plan.md Phase 0). Turn on only for a short demo/field-test session where seeing
+# every miss live on the web dashboard is worth the extra write volume -- not meant to stay on.
+LOG_IDENTIFICATION_MISSES = os.environ.get("LOG_IDENTIFICATION_MISSES", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)

@@ -17,10 +17,14 @@ main = "src/index.ts"
 compatibility_date = "2026-08-14"
 
 [vars]
-# Confirmed against this session's live test SMS (sender field in the actual Arkesel
-# request/response), not just core/config.py's fallback default -- .env overrides it to this.
-ARKESEL_SENDER_ID = "ETC Project"
+ARKESEL_SENDER_ID = "Adeton"
 TOLL_GATE_NAME = "the N1 Highway Toll Point"
 
+[observability]
+enabled = true
+
 [triggers]
+# Once a minute is the platform floor for Cron Triggers (standard 5-field cron, no seconds
+# field) -- src/index.ts's scheduled() polls internally every 15s (4 ticks per firing) so the
+# effective resolution cadence is 15s, not 60s. See POLL_INTERVAL_MS there.
 crons = ["* * * * *"]

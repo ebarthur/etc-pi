@@ -234,3 +234,27 @@ def test_cooldown_of_zero_allows_every_pass_to_charge(monkeypatch):
         txn_count = conn.execute("SELECT COUNT(*) AS c FROM transactions").fetchone()["c"]
 
     assert txn_count == 2
+
+
+def test_handle_no_read_stays_silent_by_default(monkeypatch):
+    """LOG_IDENTIFICATION_MISSES defaults off -- see its docstring in core/config.py for why
+    (a miss is by far the most common outcome of a presence trigger, so logging every one was
+    found to dominate DB writes on a Pi whose SD card has already shown real corruption)."""
+    monkeypatch.setattr(main, "LOG_IDENTIFICATION_MISSES", False)
+
+    main.handle_no_read(capture_path="/tmp/fake_frame.jpg")
+
+    with db.get_connection() as conn:
+        rows = conn.execute("SELECT * FROM audit_log WHERE event_type = 'IDENTIFICATION_FAILED'").fetchall()
+    assert rows == []
+
+
+def test_handle_no_read_logs_when_flag_enabled(monkeypatch):
+    monkeypatch.setattr(main, "LOG_IDENTIFICATION_MISSES", True)
+
+    main.handle_no_read(capture_path="/tmp/fake_frame.jpg")
+
+    with db.get_connection() as conn:
+        rows = conn.execute("SELECT * FROM audit_log WHERE event_type = 'IDENTIFICATION_FAILED'").fetchall()
+    assert len(rows) == 1
+    assert "/tmp/fake_frame.jpg" in rows[0]["event_detail"]

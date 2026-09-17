@@ -104,6 +104,31 @@ function getTursoClient(env: Env): ReturnType<typeof createClient> {
   return cachedTurso;
 }
 
+interface LogEvent {
+  log_id: number;
+  transaction_id: number | null;
+  event_type: string;
+  event_detail: string | null;
+  created_at: string;
+}
+
+// Separate from recent_events above (which caps at 8, just enough for the dashboard's own
+// side panel) -- /logs wants real scrollback, not a teaser.
+async function fetchLogs(env: Env, limit: number): Promise<LogEvent[]> {
+  const turso = getTursoClient(env);
+  const result = await turso.execute({
+    sql: "SELECT log_id, transaction_id, event_type, event_detail, created_at FROM audit_log ORDER BY log_id DESC LIMIT ?",
+    args: [limit],
+  });
+  return result.rows.map((row) => ({
+    log_id: Number(row.log_id),
+    transaction_id: row.transaction_id === null ? null : Number(row.transaction_id),
+    event_type: row.event_type as string,
+    event_detail: (row.event_detail as string | null) ?? null,
+    created_at: row.created_at as string,
+  }));
+}
+
 async function fetchDashboardData(env: Env): Promise<DashboardData> {
   const turso = getTursoClient(env);
 
@@ -189,8 +214,30 @@ export default {
       }
     }
 
+    if (url.pathname === "/api/logs") {
+      try {
+        const limit = Math.min(500, Math.max(1, Number(url.searchParams.get("limit")) || 200));
+        const events = await fetchLogs(env, limit);
+        return new Response(JSON.stringify({ events }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        const status = e instanceof Error && e.message === "Turso not configured" ? 503 : 502;
+        return new Response(JSON.stringify({ error: String(e) }), {
+          status,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
     if (url.pathname === "/") {
       return new Response(DASHBOARD_HTML, {
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    }
+
+    if (url.pathname === "/logs") {
+      return new Response(LOGS_HTML, {
         headers: { "Content-Type": "text/html; charset=utf-8" },
       });
     }
@@ -199,15 +246,11 @@ export default {
   },
 };
 
-const DASHBOARD_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>Toll Ops — Dashboard</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>
+// Shared by DASHBOARD_HTML and LOGS_HTML -- both are static template strings (no shared
+// runtime/templating engine in a Worker), so this is interpolated into each rather than
+// fetched separately. Keeps the two pages' chrome (fonts, palette, header, nav, panel/card
+// styling) from drifting apart as one gets edited without the other.
+const BASE_CSS = `
   :root {
     --bg: #F2F4F7;
     --panel: #FFFFFF;
@@ -233,11 +276,18 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     min-height: 100vh;
   }
 
+  /* Caps line length on wide/projector displays -- full-bleed edge-to-edge content past
+     ~1500px reads as unfinished, not spacious. */
+  .page {
+    max-width: 1360px;
+    margin: 0 auto;
+  }
+
   .header {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    margin-bottom: 20px;
+    margin-bottom: 16px;
     flex-wrap: wrap;
     gap: 8px;
   }
@@ -253,6 +303,74 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     font-family: var(--mono);
     font-size: 12px;
     color: var(--text-dim);
+  }
+
+  .nav {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 20px;
+  }
+  .nav a {
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    text-decoration: none;
+    padding: 7px 14px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    transition: color 0.15s, background 0.15s, border-color 0.15s;
+  }
+  .nav a:hover { color: var(--text); background: rgba(26,34,51,0.04); }
+  .nav a.active {
+    color: var(--gold);
+    background: rgba(184,121,26,0.1);
+    border-color: rgba(184,121,26,0.28);
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 16px 18px;
+    box-shadow: 0 1px 2px rgba(16,24,40,0.04);
+  }
+  .panel h2 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    margin: 0 0 12px 0;
+    font-weight: 600;
+  }
+  .panel h2 .live-tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--good);
+    background: rgba(30,143,95,0.1);
+    border: 1px solid var(--good);
+    padding: 2px 6px;
+    border-radius: 3px;
+    letter-spacing: 0.05em;
+    text-transform: none;
+    margin-left: 8px;
+  }
+`;
+
+const DASHBOARD_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Toll Ops — Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+${BASE_CSS}
+  .gantry, .metric {
+    box-shadow: 0 1px 2px rgba(16,24,40,0.04);
   }
 
   .gantry {
@@ -342,33 +460,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     .grid { grid-template-columns: 1fr; }
   }
 
-  .panel {
-    background: var(--panel);
-    border: 1px solid var(--panel-border);
-    border-radius: 6px;
-    padding: 16px 18px;
-  }
-  .panel h2 {
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--text-dim);
-    margin: 0 0 12px 0;
-    font-weight: 600;
-  }
-  .panel h2 .live-tag {
-    font-family: var(--mono);
-    font-size: 10px;
-    color: var(--good);
-    background: rgba(30,143,95,0.1);
-    border: 1px solid var(--good);
-    padding: 2px 6px;
-    border-radius: 3px;
-    letter-spacing: 0.05em;
-    text-transform: none;
-    margin-left: 8px;
-  }
-
   table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
   th {
     text-align: left;
@@ -404,10 +495,15 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 </style>
 </head>
 <body>
+<div class="page">
 
   <div class="header">
     <h1>Smart Cashless Tolling — Audit Console</h1>
     <span class="clock" id="clock">--:--:--</span>
+  </div>
+  <div class="nav">
+    <a href="/" class="active">Dashboard</a>
+    <a href="/logs">Logs</a>
   </div>
 
   <div class="gantry">
@@ -463,10 +559,13 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <div id="audit-events">
         <div style="color:var(--text-dim); font-size:12px;">Loading…</div>
       </div>
+      <div style="margin-top:10px; text-align:right;">
+        <a href="/logs" style="font-size:11px; color:var(--gold); text-decoration:none;">View full log →</a>
+      </div>
     </div>
   </div>
 
-
+</div>
 <script>
   function pad(n){ return n.toString().padStart(2,'0'); }
   function tick(){
@@ -630,6 +729,229 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   refreshDashboard();
   setInterval(refreshDashboard, 5000);
+</script>
+
+</body>
+</html>
+`;
+
+const LOGS_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Toll Ops — Logs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+${BASE_CSS}
+  .log-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+  }
+  .log-search {
+    flex: 1;
+    min-width: 220px;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text);
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 9px 12px;
+  }
+  .log-search:focus {
+    outline: none;
+    border-color: var(--gold-dim);
+    box-shadow: 0 0 0 3px rgba(184,121,26,0.12);
+  }
+  .log-count {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+
+  .log-panel {
+    padding: 0;
+    overflow: hidden;
+  }
+  .log-list {
+    max-height: 72vh;
+    overflow-y: auto;
+    font-family: var(--mono);
+    font-size: 12.5px;
+  }
+  .log-row {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 9px 16px;
+    border-bottom: 1px solid var(--panel-border);
+    border-left: 3px solid transparent;
+  }
+  .log-row:last-child { border-bottom: none; }
+  .log-row:hover { background: rgba(26,34,51,0.025); }
+  .log-row.sev-good { border-left-color: var(--good); }
+  .log-row.sev-warn { border-left-color: var(--gold); }
+  .log-row.sev-bad { border-left-color: var(--bad); }
+  .log-row.sev-neutral { border-left-color: var(--panel-border); }
+
+  .log-time { color: var(--text-dim); flex-shrink: 0; width: 68px; }
+  .log-badge {
+    flex-shrink: 0;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    padding: 2px 7px;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+  .log-badge.sev-good { background: rgba(30,143,95,0.12); color: var(--good); }
+  .log-badge.sev-warn { background: rgba(184,121,26,0.12); color: var(--gold); }
+  .log-badge.sev-bad { background: rgba(199,57,47,0.12); color: var(--bad); }
+  .log-badge.sev-neutral { background: rgba(102,112,133,0.12); color: var(--text-dim); }
+  .log-txn { flex-shrink: 0; color: var(--text-dim); font-size: 11px; width: 44px; }
+  .log-detail {
+    color: var(--text);
+    overflow-wrap: anywhere;
+  }
+  .log-empty { padding: 40px 16px; text-align: center; color: var(--text-dim); font-family: var(--sans); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="header">
+    <h1>Smart Cashless Tolling — Audit Console</h1>
+    <span class="clock" id="clock">--:--:--</span>
+  </div>
+  <div class="nav">
+    <a href="/">Dashboard</a>
+    <a href="/logs" class="active">Logs</a>
+  </div>
+
+  <div class="log-toolbar">
+    <input class="log-search" id="log-search" type="text" placeholder="Filter by event type or detail…" autocomplete="off">
+    <span class="log-count" id="log-count">Loading…</span>
+  </div>
+
+  <div class="panel log-panel">
+    <div class="log-list" id="log-list">
+      <div class="log-empty">Loading…</div>
+    </div>
+  </div>
+
+</div>
+<script>
+  function pad(n){ return n.toString().padStart(2,'0'); }
+  function tick(){
+    const d = new Date();
+    document.getElementById('clock').textContent = pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+  setInterval(tick, 1000); tick();
+
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+
+  function formatTime(sqliteDatetime){
+    const d = new Date(sqliteDatetime.replace(' ', 'T') + 'Z');
+    if (isNaN(d.getTime())) return escapeHtml(sqliteDatetime);
+    return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+
+  // Classifies every event_type this system actually emits (core/db.py's log_audit_event
+  // calls and workers/charge's audit inserts) into one of four severities for the left-border
+  // accent + badge color. Falls back to 'neutral' for anything not listed here, rather than
+  // guessing -- an unrecognized event type showing as neutral is honest; showing it as
+  // good/bad based on a naming heuristic would not be.
+  const SEVERITY = {
+    PAYMENT_VERIFIED_SUCCESS: 'good',
+    PAYMENT_LINK_SENT: 'good',
+    PAYMENT_REMINDER_SENT: 'good',
+    TURSO_SYNC_RESTORED: 'good',
+    TURSO_SYNC_GAP_RESOLVED: 'good',
+
+    UNKNOWN_RFID_UID: 'warn',
+    UNKNOWN_ANPR_PLATE: 'warn',
+    DUPLICATE_TOLL_SKIPPED: 'warn',
+    PAYMENT_LINK_REISSUED: 'warn',
+    TURSO_SYNC_GAP: 'warn',
+    TURSO_SYNC_FAILED: 'warn',
+    TURSO_REPLICA_RESET: 'warn',
+    IDENTIFICATION_FAILED: 'warn',
+
+    PAYMENT_INIT_FAILED: 'bad',
+    SMS_NOTIFY_FAILED: 'bad',
+    PAYMENT_LINK_EXHAUSTED: 'bad',
+
+    // Deliberately neutral, not 'good' -- confirmed live 2026-09-17 that Arkesel reporting
+    // success only means the platform accepted the send, not that it reached the handset.
+    SMS_SENT: 'neutral',
+  };
+  function severityOf(eventType){
+    return SEVERITY[eventType] || 'neutral';
+  }
+
+  let latestEvents = [];
+
+  function render(){
+    const list = document.getElementById('log-list');
+    const countEl = document.getElementById('log-count');
+    const filter = document.getElementById('log-search').value.trim().toLowerCase();
+
+    const filtered = !filter ? latestEvents : latestEvents.filter((e) =>
+      e.event_type.toLowerCase().includes(filter) ||
+      (e.event_detail || '').toLowerCase().includes(filter) ||
+      String(e.transaction_id || '').includes(filter)
+    );
+
+    countEl.textContent = filter
+      ? filtered.length + ' of ' + latestEvents.length + ' events'
+      : latestEvents.length + ' events (latest first)';
+
+    if (filtered.length === 0) {
+      list.innerHTML = '<div class="log-empty">' + (latestEvents.length === 0 ? 'No events yet.' : 'No events match “' + escapeHtml(filter) + '”.') + '</div>';
+      return;
+    }
+
+    let html = '';
+    for (const e of filtered) {
+      const sev = severityOf(e.event_type);
+      html +=
+        '<div class="log-row sev-' + sev + '">' +
+        '<span class="log-time">' + formatTime(e.created_at) + '</span>' +
+        '<span class="log-badge sev-' + sev + '">' + escapeHtml(e.event_type) + '</span>' +
+        '<span class="log-txn">' + (e.transaction_id ? '#' + e.transaction_id : '') + '</span>' +
+        '<span class="log-detail">' + (e.event_detail ? escapeHtml(e.event_detail) : '') + '</span>' +
+        '</div>';
+    }
+    list.innerHTML = html;
+  }
+
+  async function refreshLogs(){
+    if (document.visibilityState === 'hidden') return;
+    try {
+      const res = await fetch('/api/logs?limit=200');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      latestEvents = data.events || [];
+      render();
+    } catch (e) {
+      document.getElementById('log-count').textContent = 'Failed to load: ' + e;
+    }
+  }
+
+  document.getElementById('log-search').addEventListener('input', render);
+
+  refreshLogs();
+  setInterval(refreshLogs, 5000);
 </script>
 
 </body>

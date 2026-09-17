@@ -37,7 +37,12 @@ from typing import Optional
 from anpr.yolov11 import PlateRead
 from api_clients.arkesel import send_payment_link_sms
 from api_clients.momo import initialize_transaction
-from core.config import RFID_TIMEOUT_SECONDS, TOLL_GATE_NAME, TOLL_REPEAT_COOLDOWN_SECONDS
+from core.config import (
+    LOG_IDENTIFICATION_MISSES,
+    RFID_TIMEOUT_SECONDS,
+    TOLL_GATE_NAME,
+    TOLL_REPEAT_COOLDOWN_SECONDS,
+)
 from core.db import (
     Row,
     _sync_once,
@@ -192,17 +197,19 @@ def handle_no_read(capture_path: Optional[str] = None) -> None:
 
     Genuinely nothing left to try. This is by far the most common outcome of
     a presence trigger in practice (far more common than an actual charge),
-    so it's deliberately NOT written to audit_log/Turso -- doing that turned
-    it into the dominant source of DB writes, competing with workers/charge's
-    own writes on the same tables for no operational benefit. Local logging
-    (below) plus the captured frame (`capture_path`, written by the caller)
-    is enough to review a miss after the fact.
+    so audit-logging it is gated behind LOG_IDENTIFICATION_MISSES (off by
+    default) rather than unconditional -- see that flag's docstring in
+    core/config.py for why. Local logging (below) plus the captured frame
+    (`capture_path`, written by the caller) is always enough to review a
+    miss after the fact regardless of this flag.
     """
     detail = "no RFID tag and no ANPR plate read above confidence threshold"
     if capture_path:
         detail += f"; frame captured to {capture_path}"
     logger.warning("IDENTIFICATION FAILED: %s", detail)
     print(f"No identification within timeout ({detail}) — skipping.")
+    if LOG_IDENTIFICATION_MISSES:
+        log_audit_event("IDENTIFICATION_FAILED", event_detail=detail)
 
 
 def run_hardware_loop(dev_active: bool = False) -> None:
@@ -245,6 +252,10 @@ def run_hardware_loop(dev_active: bool = False) -> None:
         while True:
             presence.wait_for_vehicle()
             logger.info("Vehicle presence detected -- opening %.1fs RFID window", RFID_TIMEOUT_SECONDS)
+            # Real physical event, naturally rate-limited by actual traffic (not per-frame
+            # noise like the motion-diff debug logging), so this is always audit-logged --
+            # unlike handle_no_read()'s miss case, there's no write-volume concern here.
+            log_audit_event("VEHICLE_ARRIVED")
             uid = reader.read_tag(timeout=RFID_TIMEOUT_SECONDS)
             if uid:
                 logger.info("RFID read within window: uid=%s", uid)
